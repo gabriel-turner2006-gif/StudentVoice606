@@ -44,7 +44,8 @@ coverage/
 .DS_Store
 
 # Project docs and misc
-README.md
+# README.md is NOT ignored: pyproject.toml declares `readme = "README.md"`, so the
+# uv_build backend fails the image build if it is missing.
 CONTRIBUTING.md
 LICENSE
 

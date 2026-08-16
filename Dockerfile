@@ -38,24 +38,31 @@ WORKDIR /app
 
 # Copy just the dependency files first, for more efficient layer caching
 COPY pyproject.toml uv.lock ./
-RUN mkdir -p src
 
 # Install Python dependencies using UV's lock file
 # --locked ensures we use exact versions from uv.lock for reproducible builds
-# This creates a virtual environment and installs all dependencies
+# --no-install-project installs dependencies only: the uv_build backend expects
+# src/mba606_agent/__init__.py, which is not copied in until further down, so
+# installing the project here would fail the build.
 # Ensure your uv.lock file is checked in for consistency across environments
-RUN uv sync --locked
+RUN uv sync --locked --no-install-project
 
 # Pre-download any ML models or files the agent needs
 # This runs before COPY . . so the download layer is cached across code-only changes.
 # The module-level command discovers installed livekit-plugins-* packages without
 # loading your agent code.
-RUN uv run --module livekit.agents download-files
+# --no-sync: use the venv built above as-is. Without it, `uv run` re-syncs and
+# tries to build the project, whose source has not been copied in yet.
+RUN uv run --no-sync --module livekit.agents download-files
 
 # Copy all remaining application files into the container
 # This includes source code, configuration files, and dependency specifications
 # (Excludes files specified in .dockerignore)
 COPY . .
+
+# The source is present now, so the project itself can be installed. Dependencies
+# are already satisfied above, so this layer is cheap.
+RUN uv sync --locked
 
 # --- Production stage ---
 # Build tools (gcc, g++, python3-dev) are not included in the final image
