@@ -78,6 +78,28 @@ that drops during the opening never generates a POST.
 
 ## What we need from you: a resolve endpoint
 
+### Verified from our side first
+
+Before asking, we checked what already works against
+`https://towera.tail24ff87.ts.net`:
+
+- `POST /api/webhooks/phone-agent` with no key → `401`, as documented.
+- Same endpoint **with our key** and an unmatchable number → `404` with
+  `"No matching participant found for phone '+10000000000' or token 'N/A'.
+  Reconcile record manually."` So the key we were given is valid, the endpoint
+  is live, and the unmatched path behaves exactly as your doc says.
+- `POST /api/webhooks/phone-agent/resolve` → the Next.js HTML 404 page, i.e. the
+  route does not exist. That is the one gap.
+
+One thing we noticed in that error string: matching is on **phone or token**.
+Your spec calls the fallback field `spokenParticipantId`, and your app has an
+`/interview/<token>` route. If students already receive a token through the web
+app, that is a far better fallback than a spoken name and may be worth wiring up
+later — we have left it out of scope for now, but tell us if the token is
+something a student would reasonably have in front of them on a call.
+
+### The ask
+
 Your spec documents one endpoint, the transcript webhook. But the agent has to
 know **at the start of the call** whether the caller matches a student, because
 that decides how it opens the conversation — whether it greets them by name and
