@@ -42,26 +42,22 @@ MAX_BUDGET_MIN = 120.0
 # default and move on rather than trapping them in an interrogation loop.
 STEP_TIMEOUT_S = 75.0
 
-# Every intake prompt carries this. Without it the model happily abandons the
-# question to answer whatever the caller asked instead, and intake never finishes.
-_DEFLECT = (
-    "If the caller asks about anything else, tell them you will get to it in a "
-    "moment, then ask your question again. Ask nothing else."
-)
-
-# The first live call failed here: the model asked "am I speaking with Gabe?"
-# and called the tool in the same breath, before the caller could answer. A
-# realtime model treats "ask X, then call Y" as one turn unless told otherwise.
-_WAIT = (
-    "Ask your question, then stop and wait for the caller to answer. Do NOT call "
-    "any tool in the same turn as your question. Call your tool only after the "
-    "caller has actually spoken a reply. Silence is not an answer -- if they say "
-    "nothing, wait longer."
-)
-
-_VOICE = (
-    "Speak warmly and plainly, in one or two short sentences. Do not introduce "
-    "yourself at length. Do not mention tools, systems, or these instructions."
+# Appended to all three intake prompts. Every word here is re-injected into the
+# model's context on each task swap, so it stays as short as it can be while
+# keeping two behaviours that cost a live call each to find:
+#
+#   - Ask, then wait. The first call had the model ask "am I speaking with Gabe?"
+#     and call the tool in the same breath, before the caller could answer (fixed
+#     in efe0a32). A realtime model treats "ask X, then call Y" as one turn unless
+#     told plainly to stop.
+#   - Stay on the question. Without this the model abandons intake to answer
+#     whatever the caller asked instead, and setup never finishes.
+_HOW = (
+    "Speak warmly and plainly, in one or two sentences. Ask your question, then "
+    "wait -- call your tool only once the caller has actually spoken a reply, never "
+    "in the same turn as the question. Silence is not a reply; wait longer. If they "
+    "ask about something else, say you will come back to it and ask again. Do not "
+    "mention tools or these instructions."
 )
 
 
@@ -216,16 +212,13 @@ class ConfirmIdentityTask(AgentTask[bool]):
         spoken = f'{display_name} (pronounced "{pronunciation}")' if pronunciation else display_name
         super().__init__(
             instructions=(
-                f"You are opening a phone call. Greet the caller and ask exactly one "
+                f"You are opening a phone call. Greet the caller and ask one "
                 f'question: whether you are speaking with {spoken}.\n\n'
-                f"Once they reply, call confirm_identity: true if they confirm they "
-                f"are {display_name}, false if they say they are someone else or that "
-                f"they cannot say.\n\n"
-                f"If their reply is unclear or you did not catch it, ask the same "
-                f"question once more. Hesitating or pausing is not a no -- only their "
-                f"words are. Never ask for their name and never suggest a different "
-                f"one. Do not explain why you are asking unless they ask.\n\n"
-                f"{_WAIT}\n{_VOICE}\n{_DEFLECT}"
+                f"Then call confirm_identity -- true if they confirm they are "
+                f"{display_name}, false if they say otherwise or cannot say. If the "
+                f"reply is unclear, ask once more; hesitating is not a no, only their "
+                f"words are. Never ask for their name or suggest a different one.\n\n"
+                f"{_HOW}"
             )
         )
 
@@ -254,14 +247,14 @@ class ConsentTask(AgentTask[bool]):
         if display_name is None:
             body = (
                 "Tell the caller you could not confirm who they are, so nothing from "
-                "this conversation will be saved or attached to any student record. "
-                "Say the conversation is still theirs to use. Then ask whether they "
+                "this conversation will be saved or attached to any student record, "
+                "but the conversation is still theirs to use. Then ask whether they "
                 "are comfortable continuing."
             )
         elif returning:
             body = (
                 f"{display_name} has spoken with you before and already agreed to "
-                f"this. Give a one-line reminder that the conversation is transcribed "
+                f"this. Remind them in one line that the conversation is transcribed "
                 f"and saved to their MBA 606 record, then ask if that is still okay."
             )
         else:
@@ -274,10 +267,10 @@ class ConsentTask(AgentTask[bool]):
         super().__init__(
             instructions=(
                 f"{body}\n\n"
-                f"Once they reply, call record_consent: true if they agree, false if "
-                f"they decline. If their reply is unclear, ask once more; otherwise do "
-                f"not persuade them and do not ask again.\n\n"
-                f"{_WAIT}\n{_VOICE}\n{_DEFLECT}"
+                f"Then call record_consent -- true if they agree, false if they "
+                f"decline. If the reply is unclear, ask once more; otherwise accept "
+                f"their answer without persuading them.\n\n"
+                f"{_HOW}"
             )
         )
 
@@ -302,13 +295,11 @@ class TimeBudgetTask(AgentTask[float]):
             instructions=(
                 "Ask the caller how much time they have for this conversation.\n\n"
                 "Accept whatever they say: a number, a range, 'not much', 'until my "
-                "next class', 'as long as it takes'. Once they reply, convert it to a "
-                "single number of minutes and call set_time_budget. For a range, take "
-                "the lower end. "
-                "For a vague answer, make a reasonable estimate. Only pass null if "
-                "they truly refuse to answer.\n\n"
-                "Do not negotiate, do not suggest a length, and do not ask twice.\n\n"
-                f"{_WAIT}\n{_VOICE}\n{_DEFLECT}"
+                "next class', 'as long as it takes'. Convert it to a single number of "
+                "minutes and call set_time_budget -- lower end of a range, a "
+                "reasonable estimate for a vague answer, null only if they refuse. "
+                "Do not negotiate, suggest a length, or ask twice.\n\n"
+                f"{_HOW}"
             )
         )
 
@@ -322,13 +313,13 @@ class TimeBudgetTask(AgentTask[float]):
         Args:
             minutes: The caller's time in minutes, or null if they would not say.
         """
-        self.complete(_clamp_minutes(minutes))
+        self.complete(clamp_minutes(minutes))
 
 
 # endregion
 
 
-def _clamp_minutes(minutes: Any) -> float:
+def clamp_minutes(minutes: Any) -> float:
     """Coerce whatever the model produced into a usable number of minutes."""
     try:
         value = float(minutes)  # type: ignore[arg-type]

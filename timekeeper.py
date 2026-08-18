@@ -3,18 +3,25 @@
 The cascade trick of rebuilding context every turn is not available on this
 stack. With Gemini's server-side VAD owning turn-taking, the SDK returns out of
 _user_turn_completed_task before ever calling on_user_turn_completed
-(agent_activity.py), so that hook never fires here. Gemini Live's history is
-append-only besides.
+(agent_activity.py), so that hook never fires here.
 
-What does work is Agent.update_instructions(): on an active realtime session the
-plugin sends the new instruction text as a LiveClientContent turn with
-turn_complete=False -- a mid-session injection, no reconnect. The plugin's own
-docstring points at this as the way to set system-level context.
+The obvious mechanism, Agent.update_instructions(), is a trap on Gemini Live. It
+does not replace the system instruction: the plugin sends the whole instruction
+string as a LiveClientContent turn (realtime_api.py, update_instructions), which
+appends the entire mentor prompt *into the conversation* every time it is called.
+Doing that on a granularity ladder -- roughly fourteen times on a twenty minute
+call -- buried the student under a dozen recent copies of "Do not ... Do not ...",
+which is what made the agent drift slower and more rigid the longer it ran.
 
-The catch is that it re-sends the *whole* instruction string, mentor prompt
-included, on every push. So pushes are rationed rather than made every turn:
-nothing at all while the call is young, then escalating updates as the clock
-matters more. See _render() for the granularity ladder.
+So time state goes through update_chat_ctx() instead. That path diffs against the
+context the plugin already knows about and sends only what is new, so a push
+costs one short line rather than the whole prompt. Pushes are further limited to
+genuine phase changes: the model does not need to hear "about four minutes" and
+then "about three minutes", it needs to know it has crossed into narrowing or
+closing. Three pushes a call, not fourteen.
+
+Every injected line starts with [time check] so transcript.render can strip it
+back out of the student's record.
 """
 
 from __future__ import annotations
@@ -27,18 +34,22 @@ from livekit.agents import Agent, AgentSession, llm
 
 logger = logging.getLogger("mba606.timekeeper")
 
+# Marks a line as addressed to the model rather than spoken by anyone. transcript.py
+# filters on this prefix, so it has to lead the string.
+INJECTION_PREFIX = "[time check]"
+
 # Wall-clock sweep, so a long silence still advances the phase even though no
 # agent turn has completed to trigger a push.
 TICK_INTERVAL_S = 20.0
 
 # Below this fraction remaining, the clock starts being mentioned. Above it the
-# budget stated in the opening instructions is enough and every push would be
-# pure context cost.
+# budget stated at the start is enough and a push would be pure context cost.
 QUIET_UNTIL_FRACTION = 0.5
 
 _PHASE_GUIDANCE = {
     "midpoint": (
-        "Past the halfway point. Begin narrowing toward what matters most to them."
+        "Past the halfway point. Start narrowing toward what matters most to them, "
+        "and offer your read of what you have heard rather than only asking."
     ),
     "closing": (
         "Time is nearly complete. Start compressing. Ask the student what they want "
@@ -46,30 +57,9 @@ _PHASE_GUIDANCE = {
     ),
     "over": (
         "The time the student asked for has run out. Close out now: confirm their "
-        "takeaway, then let them go. Do not open a new thread and do not start a new "
-        "line of questioning. Do not end the call yourself -- leave that to them."
+        "takeaway, then let them go. Do not open a new thread. Leave hanging up to them."
     ),
 }
-
-
-def _format_remaining(seconds: float) -> str:
-    """Phrase the remaining time at a granularity that suits how much is left.
-
-    Coarse far out and fine at the end, so an ordinary stretch of conversation
-    does not generate a push per turn. Each rung produces a distinct string, which
-    is what the dedupe in _push() keys on.
-    """
-    minutes = seconds / 60.0
-
-    if minutes > 10:
-        return f"About {round(minutes / 5) * 5:.0f} minutes remain."
-    if minutes >= 2:
-        return f"About {round(minutes):.0f} minutes remain."
-    if minutes >= 1.25:
-        return "About a minute and a half remains."
-    if minutes >= 1:
-        return "About a minute remains."
-    return "Less than a minute remains."
 
 
 class TimeKeeper:
@@ -82,11 +72,13 @@ class TimeKeeper:
     def __init__(self, session: AgentSession, agent: Agent, base_instructions: str) -> None:
         self._session = session
         self._agent = agent
+        # Kept only so the caller's constructor signature does not change; time
+        # state no longer travels with the instructions.
         self._base = base_instructions
 
         self._budget_s: float | None = None
         self._started_at: float | None = None
-        self._last_line: str | None = None
+        self._last_phase: str | None = None
         self._ticker: asyncio.Task[None] | None = None
         self._pushing: asyncio.Task[None] | None = None
         self._stopped = False
@@ -100,15 +92,30 @@ class TimeKeeper:
 
         if not self._supports_injection():
             logger.warning(
-                "this model cannot take mid-session instruction updates -- the time "
-                "budget will be stated once and never refreshed. See "
-                "RealtimeModel.capabilities.mutable_instructions."
+                "this model cannot take mid-session context updates -- the time budget "
+                "will be stated once and never refreshed. See "
+                "RealtimeModel.capabilities.mutable_chat_context."
             )
             return
 
         self._session.on("agent_state_changed", self._on_agent_state)
         self._ticker = asyncio.create_task(self._tick_loop(), name="timekeeper_tick")
         logger.info("timekeeper started with a %.0f minute budget", budget_s / 60.0)
+
+    def revise(self, budget_s: float) -> None:
+        """Replace the budget mid-call, restarting the clock from now.
+
+        The student owns the time. When they say they have to go in five minutes,
+        or that something freed up, that has to move the phase boundaries rather
+        than just being acknowledged out loud. Clearing _last_phase lets the next
+        tick re-evaluate from scratch, including backwards -- a student who buys
+        themselves more time should stop being told to wrap up.
+        """
+        self._budget_s = budget_s
+        self._started_at = time.time()
+        self._last_phase = None
+        logger.info("time budget revised to %.0f minutes", budget_s / 60.0)
+        self._schedule_push()
 
     def stop(self) -> None:
         self._stopped = True
@@ -118,18 +125,18 @@ class TimeKeeper:
         self._ticker = None
 
     def _supports_injection(self) -> bool:
-        """Whether update_instructions actually reaches the model.
+        """Whether update_chat_ctx actually reaches the model.
 
-        The Gemini plugin gates mid-session updates on mutable_instructions, which
+        The Gemini plugin gates mid-session updates on mutable_chat_context, which
         it computes as `"3.1" not in model`. On a 3.1 native-audio model the call
         returns cleanly and does nothing, so this has to be checked rather than
         assumed -- a silent no-op is exactly the failure that would go unnoticed.
         """
         model = self._session.llm
         if not isinstance(model, llm.RealtimeModel):
-            # Cascade path: instructions are re-rendered per turn anyway.
+            # Cascade path: context is re-rendered per turn anyway.
             return True
-        return bool(model.capabilities.mutable_instructions)
+        return bool(model.capabilities.mutable_chat_context)
 
     # endregion
 
@@ -142,15 +149,26 @@ class TimeKeeper:
         return self._budget_s - (time.time() - self._started_at)
 
     def opening_note(self) -> str:
-        """The budget line folded into the mentor instructions before turn one."""
+        """The one line that seeds the budget before the first mentor turn.
+
+        Deliberately a chat-context line rather than an instructions edit: folding
+        it into the prompt and calling update_instructions would re-send the whole
+        mentor prompt, which is the exact cost this module exists to avoid.
+        """
         if self._budget_s is None:
             return ""
         return (
-            f"\n\nThe student said they have about {self._budget_s / 60.0:.0f} minutes. "
+            f"{INJECTION_PREFIX} The student has about {self._budget_s / 60.0:.0f} minutes. "
             f"Pace the conversation to fit that. You will be told as time runs down."
         )
 
-    def _phase(self, fraction: float) -> str | None:
+    def _phase(self) -> str | None:
+        """Which phase the call is in, or None while the clock is not worth mentioning."""
+        remaining = self.remaining_s
+        if remaining is None or not self._budget_s:
+            return None
+
+        fraction = remaining / self._budget_s
         if fraction <= 0:
             return "over"
         if fraction < 0.2:
@@ -159,30 +177,21 @@ class TimeKeeper:
             return "midpoint"
         return None
 
-    def _render(self) -> str | None:
-        """The line to inject, or None while the clock is not worth mentioning.
-
-        Granularity coarsens with distance so that an unremarkable stretch of the
-        call does not generate a push per turn: five-minute steps far out,
-        whole minutes in the middle, half minutes at the end.
-        """
-        remaining = self.remaining_s
-        if remaining is None or self._budget_s is None:
-            return None
-
-        phase = self._phase(remaining / self._budget_s)
-        if phase is None:
-            return None
+    def _render(self, phase: str) -> str:
+        remaining = self.remaining_s or 0.0
 
         if phase == "over":
-            head = ""
-        else:
-            head = (
-                f"The student asked for {self._budget_s / 60.0:.0f} minutes. "
-                f"{_format_remaining(remaining)} "
-            )
+            return f"{INJECTION_PREFIX} {_PHASE_GUIDANCE[phase]}"
 
-        return f"[time check] {head}{_PHASE_GUIDANCE[phase]}"
+        # Avoid "About 1 minutes remain" -- under 90s the count is not the useful
+        # part anyway, the instruction to start closing is.
+        minutes = remaining / 60.0
+        head = (
+            "Less than two minutes remain."
+            if minutes < 1.5
+            else f"About {round(minutes):.0f} minutes remain."
+        )
+        return f"{INJECTION_PREFIX} {head} {_PHASE_GUIDANCE[phase]}"
 
     # endregion
 
@@ -212,17 +221,30 @@ class TimeKeeper:
         self._pushing = asyncio.create_task(self._push(), name="timekeeper_push")
 
     async def _push(self) -> None:
-        line = self._render()
-        if line is None or line == self._last_line:
+        phase = self._phase()
+        if phase is None or phase == self._last_phase:
             return
 
         try:
-            await self._agent.update_instructions(f"{self._base}\n\n{line}")
+            await self.inject(self._render(phase))
         except Exception:
             logger.exception("failed to inject time state")
             return
 
-        self._last_line = line
+        self._last_phase = phase
+        logger.info("entered %s phase", phase)
+
+    async def inject(self, line: str) -> None:
+        """Append one short line to the model's context without a spoken turn.
+
+        Public because the opening budget note goes through the same path, before
+        the clock is even running.
+        """
+        if not line:
+            return
+        chat_ctx = self._agent.chat_ctx.copy()
+        chat_ctx.add_message(role="user", content=line)
+        await self._agent.update_chat_ctx(chat_ctx)
         logger.debug("injected %s", line)
 
     # endregion
