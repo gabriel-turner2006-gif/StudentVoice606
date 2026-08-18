@@ -4,6 +4,10 @@ tests/
 eval/
 evals/
 
+# Local dev tooling and human-facing docs -- not needed at runtime
+tools/
+docs/
+
 # Python bytecode and artifacts
 __pycache__/
 *.py[cod]
@@ -24,7 +28,7 @@ venv/
 coverage/
 
 # Undelivered call transcripts (host-side recovery file)
-undelivered_calls.jsonl
+logs/
 
 # Logs and temp files
 *.log

@@ -1,27 +1,17 @@
 """Keeps the student's stated time budget alive in the model's context.
 
-The cascade trick of rebuilding context every turn is not available on this
-stack. With Gemini's server-side VAD owning turn-taking, the SDK returns out of
-_user_turn_completed_task before ever calling on_user_turn_completed
-(agent_activity.py), so that hook never fires here.
+The budget is worthless as a one-time statement: it has to be re-asserted as the
+call runs, or the model forgets it and talks past the end. Each update is
+appended to the chat context as a short line (see inject), which on the cascade
+is rebuilt into the prompt on the next turn.
 
-The obvious mechanism, Agent.update_instructions(), is a trap on Gemini Live. It
-does not replace the system instruction: the plugin sends the whole instruction
-string as a LiveClientContent turn (realtime_api.py, update_instructions), which
-appends the entire mentor prompt *into the conversation* every time it is called.
-Doing that on a granularity ladder -- roughly fourteen times on a twenty minute
-call -- buried the student under a dozen recent copies of "Do not ... Do not ...",
-which is what made the agent drift slower and more rigid the longer it ran.
+Updates are rationed rather than sent every turn. Nothing is said while the call
+is young -- the opening note already carries the budget -- and the phrasing
+coarsens with distance, so an unremarkable stretch of conversation does not
+generate a push per turn. See _render for the granularity ladder.
 
-So time state goes through update_chat_ctx() instead. That path diffs against the
-context the plugin already knows about and sends only what is new, so a push
-costs one short line rather than the whole prompt. Pushes are further limited to
-genuine phase changes: the model does not need to hear "about four minutes" and
-then "about three minutes", it needs to know it has crossed into narrowing or
-closing. Three pushes a call, not fourteen.
-
-Every injected line starts with [time check] so transcript.render can strip it
-back out of the student's record.
+Wrap-up is soft throughout. The last phase tells the model to land the
+conversation; it never hangs up. The student ends the call.
 """
 
 from __future__ import annotations
@@ -30,7 +20,7 @@ import asyncio
 import logging
 import time
 
-from livekit.agents import Agent, AgentSession, llm
+from livekit.agents import Agent, AgentSession
 
 logger = logging.getLogger("mba606.timekeeper")
 
@@ -90,14 +80,6 @@ class TimeKeeper:
         self._budget_s = budget_s
         self._started_at = time.time()
 
-        if not self._supports_injection():
-            logger.warning(
-                "this model cannot take mid-session context updates -- the time budget "
-                "will be stated once and never refreshed. See "
-                "RealtimeModel.capabilities.mutable_chat_context."
-            )
-            return
-
         self._session.on("agent_state_changed", self._on_agent_state)
         self._ticker = asyncio.create_task(self._tick_loop(), name="timekeeper_tick")
         logger.info("timekeeper started with a %.0f minute budget", budget_s / 60.0)
@@ -123,20 +105,6 @@ class TimeKeeper:
             if task is not None and not task.done():
                 task.cancel()
         self._ticker = None
-
-    def _supports_injection(self) -> bool:
-        """Whether update_chat_ctx actually reaches the model.
-
-        The Gemini plugin gates mid-session updates on mutable_chat_context, which
-        it computes as `"3.1" not in model`. On a 3.1 native-audio model the call
-        returns cleanly and does nothing, so this has to be checked rather than
-        assumed -- a silent no-op is exactly the failure that would go unnoticed.
-        """
-        model = self._session.llm
-        if not isinstance(model, llm.RealtimeModel):
-            # Cascade path: context is re-rendered per turn anyway.
-            return True
-        return bool(model.capabilities.mutable_chat_context)
 
     # endregion
 

@@ -14,5 +14,6 @@ wheels/
 .env.*
 !.env.example
 
-# Calls the backend never accepted. Contains full transcripts -- never commit.
-undelivered_calls.jsonl
+# Runtime state. logs/ holds the dead-letter queue, which contains full
+# transcripts -- never commit it.
+logs/

@@ -1,19 +1,17 @@
 [project]
 name = "mba606-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "MBA 606 phone voice agent -- inbound SIP thinking partner for UofL Cardinal Intelligence"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "google-genai>=2.18.1",
-    "livekit-agents[google]>=1.6.10",
+    "livekit-agents>=1.6.10",
     "livekit-plugins-noise-cancellation>=0.3.0",
     "python-dotenv>=1.2.2",
 ]
 
-[project.scripts]
-mba606-agent = "mba606_agent:main"
-
-[build-system]
-requires = ["uv_build>=0.12.5,<0.13.0"]
-build-backend = "uv_build"
+# Not an installable package -- there is no library here, just a worker that
+# `lk agent` runs by file. Without this, uv's build backend looks for
+# src/mba606_agent/ and fails the Docker build.
+[tool.uv]
+package = false

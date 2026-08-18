@@ -1,13 +1,13 @@
 """A stand-in for the Cardinal backend, so the identified-caller path can be
 tested before the real resolve endpoint exists.
 
-    .venv/bin/python dev_stub_backend.py
+    uv run tools/dev_stub_backend.py
 
 Then, in another shell:
 
     CARDINAL_API_BASE=http://127.0.0.1:8899 \
     MBA606_FAKE_CALLER=+15025551234 \
-    lk agent console test_agent.py
+    lk agent console agent.py
 
 It implements both endpoints with the contract proposed in
 BACKEND_INTEGRATION.md and prints whatever it receives, so you can read the

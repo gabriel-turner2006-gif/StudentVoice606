@@ -41,9 +41,9 @@ COPY pyproject.toml uv.lock ./
 
 # Install Python dependencies using UV's lock file
 # --locked ensures we use exact versions from uv.lock for reproducible builds
-# --no-install-project installs dependencies only: the uv_build backend expects
-# src/mba606_agent/__init__.py, which is not copied in until further down, so
-# installing the project here would fail the build.
+# --no-install-project installs dependencies only. This project is marked
+# `package = false` (there is no library, just a worker run by file), so there
+# is nothing to install beyond the dependency set either way.
 # Ensure your uv.lock file is checked in for consistency across environments
 RUN uv sync --locked --no-install-project
 
@@ -92,4 +92,4 @@ USER appuser
 # Run the application using UV
 # UV will activate the virtual environment and run the agent.
 # The "start" command tells the worker to connect to LiveKit and begin waiting for jobs.
-CMD ["uv", "run", "test_agent.py", "start"]
+CMD ["uv", "run", "agent.py", "start"]

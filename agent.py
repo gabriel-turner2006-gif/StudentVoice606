@@ -33,10 +33,6 @@ SNAPPY = os.getenv("MBA606_SNAPPY") == "1"
 if SNAPPY:
     INSTRUCTIONS = SNAPPY_INSTRUCTIONS
 
-# The resolve request is fired the moment the caller joins, so by the time the
-# session is up it is normally already done. This is the ceiling on how long the
-# caller waits in silence for it before we give up and treat the call as anonymous.
-
 logger = logging.getLogger("mba606.latency")
 
 # `lk agent console` / `lk agent dev` discover this module-level variable.

@@ -14,9 +14,9 @@ ever enters the payload.
 
 AgentTask is the mechanism (livekit-agents 1.6.10). Awaiting one swaps the running
 agent's instructions for the task's, collects a typed answer through a single tool
-call, then restores the previous agent. Await them from on_enter only: Gemini's
-realtime model reports manual_function_calls=False, and the SDK warns that
-awaiting an AgentTask inside a function tool on such a model is undefined.
+call, then restores the previous agent. Await them from on_enter, which the SDK
+marks as an inline-task context; awaiting one from inside a function tool is a
+different and more fragile path.
 """
 
 from __future__ import annotations
@@ -49,10 +49,10 @@ STEP_TIMEOUT_S = 75.0
 # model's context on each task swap, so it stays as short as it can be while
 # keeping two behaviours that cost a live call each to find:
 #
-#   - Ask, then wait. The first call had the model ask "am I speaking with Gabe?"
-#     and call the tool in the same breath, before the caller could answer (fixed
-#     in efe0a32). A realtime model treats "ask X, then call Y" as one turn unless
-#     told plainly to stop.
+#   - Ask, then wait. An early live call had the model ask its question and call
+#     the tool in the same breath, before the caller could answer (fixed in
+#     efe0a32). "Ask X, then call Y" reads as a single turn unless told plainly
+#     to stop and wait.
 #   - Stay on the question. Without this the model abandons intake to answer
 #     whatever the caller asked instead, and setup never finishes.
 _HOW = (
