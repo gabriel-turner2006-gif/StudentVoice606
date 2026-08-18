@@ -127,6 +127,14 @@ one-line reminder instead of the full consent explanation. **Ship it without tha
 field if it is inconvenient** — we treat a missing value as `false`, which just
 means everyone hears the full script.
 
+`pronunciation` is also optional, and worth more than it looks. Our voice model
+mispronounces short and uncommon names — on our first live call it read "Gabe"
+as "Get". The agent's opening line is *"am I speaking with &lt;name&gt;?"*, so a
+mangled name is the first thing a student hears. If you can carry a phonetic
+respelling (`"Gabe"` → `"Gayb"`) on the participant record, even sparsely
+populated for the names that need it, we will use it. Absent means we say the
+name as written.
+
 The path is configurable on our side (`CARDINAL_RESOLVE_PATH`), so name it
 whatever fits your routing.
 

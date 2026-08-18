@@ -49,6 +49,16 @@ _DEFLECT = (
     "moment, then ask your question again. Ask nothing else."
 )
 
+# The first live call failed here: the model asked "am I speaking with Gabe?"
+# and called the tool in the same breath, before the caller could answer. A
+# realtime model treats "ask X, then call Y" as one turn unless told otherwise.
+_WAIT = (
+    "Ask your question, then stop and wait for the caller to answer. Do NOT call "
+    "any tool in the same turn as your question. Call your tool only after the "
+    "caller has actually spoken a reply. Silence is not an answer -- if they say "
+    "nothing, wait longer."
+)
+
 _VOICE = (
     "Speak warmly and plainly, in one or two short sentences. Do not introduce "
     "yourself at length. Do not mention tools, systems, or these instructions."
@@ -114,7 +124,8 @@ def _digits(phone: str) -> str:
 def admin_bypass(phone_number: str | None) -> Student | None:
     """Fake a resolved student for one configured number, for end-to-end testing.
 
-    Set MBA606_ADMIN_BYPASS to "<phone>:<display name>". It exists because the
+    Set MBA606_ADMIN_BYPASS to "<phone>:<display name>" or
+    "<phone>:<display name>:<pronunciation>". It exists because the
     backend's resolve endpoint does not, and without it there is no way to
     exercise the identified-caller path -- identity confirmation, the named
     consent script, a recordable call -- over a real phone line.
@@ -127,8 +138,9 @@ def admin_bypass(phone_number: str | None) -> Student | None:
     if not raw or not phone_number:
         return None
 
-    configured, _, display_name = raw.partition(":")
-    display_name = display_name.strip()
+    configured, _, rest = raw.partition(":")
+    display_name, _, pronunciation = rest.partition(":")
+    display_name, pronunciation = display_name.strip(), pronunciation.strip()
     if not configured.strip() or not display_name:
         logger.error("MBA606_ADMIN_BYPASS is malformed, expected '<phone>:<name>': %r", raw)
         return None
@@ -145,6 +157,7 @@ def admin_bypass(phone_number: str | None) -> Student | None:
     return Student(
         participant_id=f"ADMIN_BYPASS_{_digits(phone_number)}",
         display_name=display_name,
+        pronunciation=pronunciation or None,
     )
 
 
@@ -196,17 +209,23 @@ def extract_caller_id(participant: rtc.RemoteParticipant | None) -> tuple[str | 
 class ConfirmIdentityTask(AgentTask[bool]):
     """Confirms the resolved name belongs to the person on the line."""
 
-    def __init__(self, display_name: str) -> None:
+    def __init__(self, display_name: str, pronunciation: str | None = None) -> None:
+        # Native-audio models mangle short names -- the first live call rendered
+        # "Gabe" as "Get". A phonetic respelling in the prompt is the only lever
+        # we have, since there is no separate TTS layer to hand a lexicon to.
+        spoken = f'{display_name} (pronounced "{pronunciation}")' if pronunciation else display_name
         super().__init__(
             instructions=(
                 f"You are opening a phone call. Greet the caller and ask exactly one "
-                f'question: whether you are speaking with {display_name}. '
-                f"Then call confirm_identity with what they said.\n\n"
-                f"Pass true only if they clearly confirm they are {display_name}. "
-                f"If they say they are someone else, if they hesitate, or if they are "
-                f"unsure, pass false. Never ask for their name and never suggest one. "
-                f"Do not explain why you are asking unless they ask.\n\n"
-                f"{_VOICE}\n{_DEFLECT}"
+                f'question: whether you are speaking with {spoken}.\n\n'
+                f"Once they reply, call confirm_identity: true if they confirm they "
+                f"are {display_name}, false if they say they are someone else or that "
+                f"they cannot say.\n\n"
+                f"If their reply is unclear or you did not catch it, ask the same "
+                f"question once more. Hesitating or pausing is not a no -- only their "
+                f"words are. Never ask for their name and never suggest a different "
+                f"one. Do not explain why you are asking unless they ask.\n\n"
+                f"{_WAIT}\n{_VOICE}\n{_DEFLECT}"
             )
         )
 
@@ -255,10 +274,10 @@ class ConsentTask(AgentTask[bool]):
         super().__init__(
             instructions=(
                 f"{body}\n\n"
-                f"Call record_consent with their answer: true if they agree, false if "
-                f"they decline or will not give a clear yes. Do not persuade them and "
-                f"do not ask twice.\n\n"
-                f"{_VOICE}\n{_DEFLECT}"
+                f"Once they reply, call record_consent: true if they agree, false if "
+                f"they decline. If their reply is unclear, ask once more; otherwise do "
+                f"not persuade them and do not ask again.\n\n"
+                f"{_WAIT}\n{_VOICE}\n{_DEFLECT}"
             )
         )
 
@@ -283,12 +302,13 @@ class TimeBudgetTask(AgentTask[float]):
             instructions=(
                 "Ask the caller how much time they have for this conversation.\n\n"
                 "Accept whatever they say: a number, a range, 'not much', 'until my "
-                "next class', 'as long as it takes'. Convert it to a single number of "
-                "minutes and call set_time_budget. For a range, take the lower end. "
+                "next class', 'as long as it takes'. Once they reply, convert it to a "
+                "single number of minutes and call set_time_budget. For a range, take "
+                "the lower end. "
                 "For a vague answer, make a reasonable estimate. Only pass null if "
                 "they truly refuse to answer.\n\n"
                 "Do not negotiate, do not suggest a length, and do not ask twice.\n\n"
-                f"{_VOICE}\n{_DEFLECT}"
+                f"{_WAIT}\n{_VOICE}\n{_DEFLECT}"
             )
         )
 
@@ -359,7 +379,7 @@ async def run_intake(state: CallState) -> None:
     """
     if state.student is not None:
         confirmed = await _run_step(
-            ConfirmIdentityTask(state.student.display_name),
+            ConfirmIdentityTask(state.student.display_name, state.student.pronunciation),
             default=False,
             label="confirm_identity",
         )

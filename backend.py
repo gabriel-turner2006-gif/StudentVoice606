@@ -53,6 +53,10 @@ class Student:
     participant_id: str
     display_name: str
     consent_on_file: bool = False
+    # Optional phonetic respelling. Native-audio models mispronounce short and
+    # uncommon names, and a student being greeted by a mangled version of their
+    # own name is a bad first three seconds.
+    pronunciation: str | None = None
 
 
 class CardinalClient:
@@ -240,6 +244,7 @@ def _parse_student(payload: Any) -> Student | None:
         # Absent means "assume we have never asked", which is the safe reading:
         # worst case a returning student hears the full consent script twice.
         consent_on_file=bool(payload.get("consentOnFile") or payload.get("consent_on_file")),
+        pronunciation=(payload.get("pronunciation") or None),
     )
 
 
