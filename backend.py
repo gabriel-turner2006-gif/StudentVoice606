@@ -1,6 +1,6 @@
 """Client for the Cardinal Intelligence phone-agent webhook.
 
-One call matters: submit_transcript(), once, when the call ends. The backend is
+One call matters: submit_call(), once, when the call ends. The backend is
 an end-of-call ingestion webhook rather than a lifecycle API -- caller matching
 happens there, on the phone number, after the conversation is over.
 
@@ -153,37 +153,61 @@ class CardinalClient:
             )
         return student
 
-    async def submit_transcript(
+    async def submit_call(
         self,
         *,
         phone_number: str,
-        transcript: str,
+        recording_consent: bool,
         call_duration_sec: int,
+        transcript: str | None = None,
+        consent_captured_at: str | None = None,
         call_status: str | None = None,
     ) -> bool:
         """POST a finished call. Returns whether the backend accepted it.
 
-        A rejection is not retried -- 4xx means the payload or the key is wrong and
-        sending it again changes nothing. Transport failures get a few attempts,
-        then the payload lands in the dead-letter file.
+        The consent contract is strict on their side and mirrored here so a bug
+        fails locally rather than as an opaque 400:
+
+          consent true  -> transcript required, non-empty
+          consent false -> transcript must be ABSENT, not a placeholder
+          consent missing -> rejected; silence is never consent
+
+        A declined call is still posted. It stores an audit record -- a call
+        happened and consent was refused -- and is kept even when the phone
+        number matches no participant, which is the one case where a 404 does
+        not apply. Nothing is queued for extraction.
         """
+        if recording_consent and not (transcript or "").strip():
+            logger.error("refusing to post: consent given but transcript is empty")
+            return False
+        if not recording_consent and transcript is not None:
+            logger.error("refusing to post: consent declined but a transcript was passed")
+            return False
+
         payload: dict[str, Any] = {
             "phoneNumber": phone_number,
-            "transcript": transcript,
             "callDurationSec": call_duration_sec,
+            "recordingConsent": recording_consent,
         }
+        if transcript is not None:
+            payload["transcript"] = transcript
+        if consent_captured_at is not None:
+            payload["consentCapturedAt"] = consent_captured_at
         if call_status is not None:
             payload["callStatus"] = call_status
+
+        what = "transcript" if recording_consent else "declined-call record"
 
         if not self.enabled:
             # Print what would have gone over the wire. Without this a test call
             # against no backend leaves nothing to inspect, which is precisely when
             # you most want to read the transcript.
             logger.info(
-                "no backend configured -- would have submitted %ss of call for %s:\n%s",
-                call_duration_sec,
+                "no backend configured -- would have posted a %s for %s (%ss):\n%s",
+                what,
                 phone_number,
-                transcript,
+                call_duration_sec,
+                transcript if transcript is not None else "(no transcript, consent declined)",
             )
             return False
 
@@ -198,11 +222,17 @@ class CardinalClient:
                     timeout=aiohttp.ClientTimeout(total=SUBMIT_TIMEOUT_S),
                 ) as resp:
                     if resp.status == 202:
+                        status = ""
+                        try:
+                            status = (await resp.json()).get("status", "")
+                        except Exception:
+                            pass
                         logger.info(
-                            "transcript accepted for %s (%ss, %d chars)",
+                            "%s accepted for %s (%ss)%s",
+                            what,
                             phone_number,
                             call_duration_sec,
-                            len(transcript),
+                            f" -- {status}" if status else "",
                         )
                         return True
 
@@ -212,22 +242,22 @@ class CardinalClient:
                     if 400 <= resp.status < 500:
                         # Terminal. 401 is a bad key, 404 is an unmatched number,
                         # 400 is a payload we built wrong -- none improve on retry.
-                        logger.error("transcript rejected, not retrying -- %s", last_error)
+                        logger.error("call rejected, not retrying -- %s", last_error)
                         _dead_letter(payload, last_error)
                         return False
 
-                    logger.warning("transcript submit attempt %d failed -- %s", attempt, last_error)
+                    logger.warning("submit attempt %d failed -- %s", attempt, last_error)
             except asyncio.TimeoutError:
                 last_error = f"timeout after {SUBMIT_TIMEOUT_S}s"
-                logger.warning("transcript submit attempt %d timed out", attempt)
+                logger.warning("submit attempt %d timed out", attempt)
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning("transcript submit attempt %d errored -- %s", attempt, last_error)
+                logger.warning("submit attempt %d errored -- %s", attempt, last_error)
 
             if attempt < SUBMIT_ATTEMPTS:
                 await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
 
-        logger.error("transcript undeliverable after %d attempts -- %s", SUBMIT_ATTEMPTS, last_error)
+        logger.error("call undeliverable after %d attempts -- %s", SUBMIT_ATTEMPTS, last_error)
         _dead_letter(payload, last_error)
         return False
 
