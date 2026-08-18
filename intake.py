@@ -25,6 +25,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -72,6 +73,13 @@ class CallState:
     answered_at: float = field(default_factory=time.time)
 
     consent: bool = False
+    # When the caller answered the consent question, ISO 8601 UTC. Bounds any
+    # audio buffered before the decline, which is what makes it useful to an
+    # auditor rather than just decorative.
+    consent_captured_at: str | None = None
+    # Set when a caller who declined took the offer to hang up.
+    wants_to_end: bool = False
+
     time_budget_s: float | None = None
 
     intake_complete: bool = False
@@ -164,6 +172,45 @@ class ConsentTask(AgentTask[bool]):
         self.complete(agrees)
 
 
+class DeclineExitTask(AgentTask[bool]):
+    """After a decline, offers to end the call. Offers -- never imposes.
+
+    These check-ins return nothing to the student except the conversation
+    itself, so once recording is off there is genuinely little left to do and
+    saying so is honest. But making the hang-up automatic would turn a
+    voluntary choice into a penalty for exercising it, so the caller decides.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            instructions=(
+                "The caller just declined to be recorded. Accept that warmly and "
+                "without a trace of disappointment -- it was a real choice and they "
+                "made it.\n\n"
+                "Tell them that because nothing is being saved, this call will not "
+                "feed into their coursework, but that you are happy to keep talking "
+                "if it would be useful. Then ask whether they would like to end here "
+                "or carry on.\n\n"
+                "Call decide_end -- true if they want to hang up, false if they want "
+                "to keep talking. If they are unsure, treat that as carrying on and "
+                "pass false; never hang up on an unclear answer.\n\n"
+                f"{_HOW}"
+            )
+        )
+
+    async def on_enter(self) -> None:
+        self.session.generate_reply()
+
+    @function_tool
+    async def decide_end(self, end_call: bool) -> None:
+        """Record whether the caller wants to end the call now.
+
+        Args:
+            end_call: True only if they clearly want to hang up.
+        """
+        self.complete(end_call)
+
+
 class TimeBudgetTask(AgentTask[float]):
     """Asks how long the caller has and normalizes the answer to minutes."""
 
@@ -246,6 +293,18 @@ async def run_intake(state: CallState) -> None:
     leave the caller with a working conversation.
     """
     state.consent = await _run_step(ConsentTask(), default=False, label="consent")
+    state.consent_captured_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    if not state.consent:
+        state.wants_to_end = await _run_step(
+            DeclineExitTask(), default=False, label="decline_exit"
+        )
+        if state.wants_to_end:
+            # No time question -- they are leaving. intake_complete stays False so
+            # nothing downstream mistakes this for a set-up conversation.
+            state.intake_finished_at = time.time()
+            logger.info("consent declined and caller chose to end the call")
+            return
 
     budget_min = await _run_step(
         TimeBudgetTask(),

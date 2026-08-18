@@ -30,6 +30,9 @@ ROSTER = {
 
 API_KEY = "cardinal-voice-agent-secret-key-2026"
 
+# Everything the stub accepted, for inspection at the end of a test run.
+received: list[dict] = []
+
 
 def _authorized(req: web.Request) -> bool:
     if req.headers.get("x-api-key") == API_KEY:
@@ -54,36 +57,54 @@ async def resolve(req: web.Request) -> web.Response:
 
 
 async def submit(req: web.Request) -> web.Response:
+    """Mirrors the Option A consent contract, in their stated validation order."""
     if not _authorized(req):
         print("  submit -> 401 (bad key)")
         return web.json_response({"error": "unauthorized"}, status=401)
 
     body = await req.json()
+    consent = body.get("recordingConsent")
+    transcript = body.get("transcript")
 
-    # Mirror the real validator: schema is checked BEFORE participant matching,
-    # and a missing or empty transcript 400s without ever reaching the lookup.
-    if not (body.get("transcript") or "").strip():
-        print("  submit -> 400 (no transcript text)")
+    # Schema before matching. Consent is checked first and fails closed.
+    if not isinstance(consent, bool):
+        print("  submit -> 400 (recordingConsent missing)")
+        return web.json_response({"error": "recordingConsent is required"}, status=400)
+    if not isinstance(body.get("callDurationSec"), (int, float)):
+        print("  submit -> 400 (callDurationSec missing)")
+        return web.json_response({"error": "Malformed payload: callDurationSec"}, status=400)
+    if consent and not (transcript or "").strip():
+        print("  submit -> 400 (consent true, no transcript)")
         return web.json_response(
             {"error": "Malformed payload: Must provide raw transcript text or audio segments"},
             status=400,
         )
-    if not isinstance(body.get("callDurationSec"), (int, float)):
-        print("  submit -> 400 (no callDurationSec)")
-        return web.json_response({"error": "Malformed payload: callDurationSec"}, status=400)
+    if not consent and transcript is not None:
+        print("  submit -> 400 (consent false, transcript present)")
+        return web.json_response(
+            {"error": "transcript must be absent when recordingConsent is false"}, status=400
+        )
 
-    if body.get("phoneNumber") not in ROSTER:
-        print(f"  submit {body.get('phoneNumber')} -> 404 (not on the roster)")
+    phone = body.get("phoneNumber")
+    matched = phone in ROSTER
+
+    if not consent:
+        # Stored either way -- the audit trail survives an unmatched number.
+        print(f"  submit {phone} -> 202 recorded_declined (matched={matched})")
+        received.append(body)
+        return web.json_response({"status": "recorded_declined"}, status=202)
+
+    if not matched:
+        print(f"  submit {phone} -> 404 (not on the roster)")
         return web.json_response({"error": "no match"}, status=404)
 
     print("\n" + "=" * 72)
-    print(f"TRANSCRIPT ACCEPTED  {body['phoneNumber']}  {body['callDurationSec']}s")
-    if "callStatus" in body:
-        print(f"callStatus: {body['callStatus']}")
+    print(f"ACCEPTED  {phone}  {body['callDurationSec']}s  consentAt={body.get('consentCapturedAt')}")
     print("=" * 72)
-    print(body["transcript"])
+    print(transcript)
     print("=" * 72 + "\n")
-    return web.json_response({"ok": True}, status=202)
+    received.append(body)
+    return web.json_response({"status": "accepted"}, status=202)
 
 
 def main() -> None:

@@ -36,15 +36,6 @@ if SNAPPY:
 # The resolve request is fired the moment the caller joins, so by the time the
 # session is up it is normally already done. This is the ceiling on how long the
 # caller waits in silence for it before we give up and treat the call as anonymous.
-# A consented call still needs to contain a conversation. Below this many turns
-# after intake finished, there is nothing worth putting on a student's record.
-MIN_SUBSTANTIVE_TURNS = 4
-
-# What goes in the transcript field when the student says no. It must not be
-# empty: their validator rejects a payload with no transcript text before it ever
-# reaches participant matching, so an empty string risks a 400 that looks like a
-# malformed request rather than a handled decline.
-DECLINED_TRANSCRIPT = "Student did not consent to recording. No transcript retained."
 
 logger = logging.getLogger("mba606.latency")
 
@@ -81,6 +72,17 @@ class MentorAgent(Agent):
 
         state = self._state
         await run_intake(state)
+
+        if state.wants_to_end:
+            # drain=True so the goodbye is actually spoken before the line drops.
+            await self.session.generate_reply(
+                instructions=(
+                    "Say a short, warm goodbye and thank them for calling. One "
+                    "sentence. Do not ask anything further."
+                )
+            )
+            self.session.shutdown(drain=True)
+            return
 
         keeper = TimeKeeper(self.session, self, INSTRUCTIONS)
         self.timekeeper = keeper
@@ -253,29 +255,31 @@ async def entrypoint(ctx: JobContext):
                 return
 
             if not state.consent:
-                # Still reported. The student declined to have their words kept,
-                # not to have the call exist -- duration is what the pilot needs
-                # and it carries none of what they said.
+                # Posted with no transcript at all. A placeholder string would be
+                # rejected: their contract is consent false -> transcript absent,
+                # so that a client bug cannot leak content past a decline. The
+                # record still lands even if the number matches no participant.
                 logger.info(
-                    "call over (%ss) -- student declined recording, posting duration only",
+                    "call over (%ss) -- recording declined, posting the audit record",
                     duration,
                 )
-                await client.submit_transcript(
+                await client.submit_call(
                     phone_number=state.phone_number,
-                    transcript=DECLINED_TRANSCRIPT,
+                    recording_consent=False,
                     call_duration_sec=duration,
-                    call_status=None,
+                    consent_captured_at=state.consent_captured_at,
                 )
                 return
 
             text, _ = transcript.render(session.history, state.answered_at)
-            substantive = transcript.count_after(session.history, state.intake_finished_at)
 
-            if substantive < MIN_SUBSTANTIVE_TURNS:
-                logger.info(
-                    "call over (%ss) -- only %d turns after setup, not submitting",
+            if not text.strip():
+                # Cannot be posted either way: consent true demands a transcript,
+                # and claiming consent false would misstate what the caller said.
+                logger.warning(
+                    "call over (%ss) -- consent given but transcript is empty, "
+                    "nothing posted",
                     duration,
-                    substantive,
                 )
                 return
 
@@ -284,10 +288,12 @@ async def entrypoint(ctx: JobContext):
             # human spot the duplicate.
             header = f"[call {state.sip_call_id or 'unknown'}]"
 
-            await client.submit_transcript(
+            await client.submit_call(
                 phone_number=state.phone_number,
+                recording_consent=True,
                 transcript=f"{header}\n{text}",
                 call_duration_sec=duration,
+                consent_captured_at=state.consent_captured_at,
                 # callStatus is deliberately omitted. The backend rejects values it
                 # reads as dropped/cancelled with a 400, and the accepted set is not
                 # finalized -- sending a guess risks throwing away a good call.
