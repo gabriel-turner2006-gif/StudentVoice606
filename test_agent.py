@@ -134,6 +134,31 @@ class MentorAgent(Agent):
 
         return f"Time budget is now {budget_s / 60.0:.0f} minutes from now."
 
+    @function_tool
+    async def set_speaking_rate(self, rate: str) -> str:
+        """Change how fast you speak, when the student asks you to.
+
+        Call this if they say you are talking too fast or too slow, ask you to
+        slow down, or ask you to hurry. Do not call it for anything else -- it
+        changes your voice, not the pace of the conversation.
+
+        Args:
+            rate: One of "slow", "normal", or "fast".
+        """
+        rate = (rate or "").strip().lower()
+        if rate not in ("slow", "normal", "fast"):
+            return "Rate must be slow, normal, or fast."
+
+        tts = self.session.tts
+        if tts is None or not hasattr(tts, "update_options"):
+            return "Speaking rate cannot be changed on this pipeline."
+
+        # Merges into extra_kwargs and is sent with each synthesis request, so it
+        # takes effect from the next reply rather than mid-sentence.
+        tts.update_options(extra_kwargs={"speed": rate})
+        logger.info("speaking rate set to %s", rate)
+        return f"Speaking rate is now {rate}."
+
 
 # No agent_name: automatic dispatch, so the worker joins every room in the
 # project, including the call_* rooms the SIP rule creates. Setting a name would
@@ -193,22 +218,28 @@ async def entrypoint(ctx: JobContext):
         nonlocal turn_no
         if getattr(ev.item, "role", None) != "assistant":
             return
-        m = getattr(ev.item, "metrics", None)
-        if m is None:
+        # MetricsReport is a TypedDict -- a plain dict at runtime. The framework
+        # builds it as `assistant_metrics: llm.MetricsReport = {}` and assigns by
+        # key, so it must be read with .get(). Reading it with getattr() returns
+        # None for every field and logs a full row of "n/a" without erroring,
+        # which is exactly how the first cascade call came back blind.
+        m = getattr(ev.item, "metrics", None) or {}
+        if not m:
             return
         turn_no += 1
 
-        def ms(value):
+        def ms(key):
+            value = m.get(key)
             return f"{value * 1000:.0f}ms" if isinstance(value, (int, float)) else "n/a"
 
         logger.info(
             "turn %d: e2e %s | eot %s | stt %s | llm %s | tts %s",
             turn_no,
-            ms(getattr(m, "e2e_latency", None)),
-            ms(getattr(m, "end_of_turn_delay", None)),
-            ms(getattr(m, "transcription_delay", None)),
-            ms(getattr(m, "llm_node_ttft", None)),
-            ms(getattr(m, "tts_node_ttfb", None)),
+            ms("e2e_latency"),
+            ms("end_of_turn_delay"),
+            ms("transcription_delay"),
+            ms("llm_node_ttft"),
+            ms("tts_node_ttfb"),
         )
 
     agent = MentorAgent(state=state, resolve_task=resolve_task)
