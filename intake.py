@@ -28,7 +28,7 @@ from typing import Any, TypeVar
 from livekit import rtc
 from livekit.agents import AgentTask, function_tool
 
-from backend import Student
+from backend import CardinalClient, Student
 
 logger = logging.getLogger("mba606.intake")
 
@@ -75,6 +75,11 @@ class CallState:
     intake_complete: bool = False
     intake_finished_at: float | None = None
 
+    # True when the student was faked by MBA606_ADMIN_BYPASS rather than matched
+    # by the backend. Nothing downstream branches on it -- it exists so a test
+    # call is never mistaken for a real one in the logs.
+    bypassed: bool = False
+
     @property
     def recordable(self) -> bool:
         """Whether this call may be attached to a student record.
@@ -94,6 +99,61 @@ class CallState:
         if not self.consent:
             return "caller did not consent to transcription"
         return "recordable"
+
+
+def _digits(phone: str) -> str:
+    """Last ten digits, which is what survives every caller-ID format we might see.
+
+    Matching on the literal string would break the moment the carrier delivered
+    "15024086419" instead of "+15024086419", and the failure would look like the
+    bypass simply not working.
+    """
+    return "".join(c for c in phone if c.isdigit())[-10:]
+
+
+def admin_bypass(phone_number: str | None) -> Student | None:
+    """Fake a resolved student for one configured number, for end-to-end testing.
+
+    Set MBA606_ADMIN_BYPASS to "<phone>:<display name>". It exists because the
+    backend's resolve endpoint does not, and without it there is no way to
+    exercise the identified-caller path -- identity confirmation, the named
+    consent script, a recordable call -- over a real phone line.
+
+    The participant id it invents is deliberately synthetic. If this is ever left
+    on while a real CARDINAL_API_BASE is configured, the resulting call cannot
+    land on a genuine student record.
+    """
+    raw = os.getenv("MBA606_ADMIN_BYPASS")
+    if not raw or not phone_number:
+        return None
+
+    configured, _, display_name = raw.partition(":")
+    display_name = display_name.strip()
+    if not configured.strip() or not display_name:
+        logger.error("MBA606_ADMIN_BYPASS is malformed, expected '<phone>:<name>': %r", raw)
+        return None
+
+    if _digits(configured) != _digits(phone_number):
+        return None
+
+    logger.warning(
+        "ADMIN BYPASS ACTIVE -- caller %s is being treated as %s without asking the "
+        "backend. This is a test path; the participant id is synthetic.",
+        phone_number,
+        display_name,
+    )
+    return Student(
+        participant_id=f"ADMIN_BYPASS_{_digits(phone_number)}",
+        display_name=display_name,
+    )
+
+
+async def resolve_caller(client: CardinalClient, phone_number: str | None) -> Student | None:
+    """Resolve a caller, letting the admin bypass short-circuit the backend."""
+    override = admin_bypass(phone_number)
+    if override is not None:
+        return override
+    return await client.resolve_caller(phone_number)
 
 
 def extract_caller_id(participant: rtc.RemoteParticipant | None) -> tuple[str | None, str | None]:

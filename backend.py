@@ -168,10 +168,14 @@ class CardinalClient:
             payload["callStatus"] = call_status
 
         if not self.enabled:
+            # Print what would have gone over the wire. Without this a test call
+            # against no backend leaves nothing to inspect, which is precisely when
+            # you most want to read the transcript.
             logger.info(
-                "no backend configured -- would have submitted %ss of call for %s",
+                "no backend configured -- would have submitted %ss of call for %s:\n%s",
                 call_duration_sec,
                 phone_number,
+                transcript,
             )
             return False
 

@@ -13,7 +13,7 @@ from livekit.plugins import google, noise_cancellation
 
 import transcript
 from backend import CardinalClient
-from intake import CallState, extract_caller_id, run_intake
+from intake import CallState, extract_caller_id, resolve_caller, run_intake
 from timekeeper import TimeKeeper
 
 BASE_DIR = Path(__file__).parent
@@ -112,6 +112,10 @@ class MentorAgent(Agent):
         except Exception:
             logger.exception("caller lookup failed -- proceeding anonymously")
 
+        state.bypassed = state.student is not None and state.student.participant_id.startswith(
+            "ADMIN_BYPASS_"
+        )
+
         await run_intake(state)
 
         keeper = TimeKeeper(self.session, self, INSTRUCTIONS)
@@ -152,7 +156,7 @@ async def entrypoint(ctx: JobContext):
 
     phone_number, sip_call_id = extract_caller_id(participant)
     state = CallState(phone_number=phone_number, sip_call_id=sip_call_id)
-    resolve_task = asyncio.create_task(client.resolve_caller(phone_number), name="resolve_caller")
+    resolve_task = asyncio.create_task(resolve_caller(client, phone_number), name="resolve_caller")
 
     session = AgentSession(
         userdata=state,
@@ -269,6 +273,12 @@ async def entrypoint(ctx: JobContext):
                     substantive,
                 )
                 return
+
+            if state.bypassed:
+                logger.warning(
+                    "submitting a call that used ADMIN BYPASS -- the participant id is "
+                    "synthetic, so this can only match on phone number, if at all"
+                )
 
             await client.submit_transcript(
                 phone_number=state.phone_number,
