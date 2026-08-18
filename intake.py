@@ -1,13 +1,16 @@
 """The first thirty seconds of a call.
 
-Three questions, asked in order, each by a throwaway sub-agent that knows nothing
-about MBA 606: is this who we think it is, may we transcribe, and how long do you
-have. Only when all three land does the conversation become recordable.
+Two questions, asked in order by throwaway sub-agents that know nothing about
+MBA 606: may we transcribe this, and how long do you have. Consent comes first,
+before any other setup work, so a caller who declines has said so before we have
+spent their time on anything else.
 
-The hard rule is in CallState.recordable: a record is attached only when the
-*phone number* resolved, the caller confirmed that identity, and the caller
-consented. A name spoken aloud never attaches anything -- there is deliberately no
-code path from "the caller said they are Sarah" to a student record.
+There is deliberately no identity step. The backend resolves the caller from the
+phone number *after* the call, when the transcript is posted -- it has no
+side-effect-free lookup, so there is nothing to confirm against mid-call and no
+name to greet them by. That also means misattribution is impossible from here:
+we send the number the carrier gave us and they match it, and no spoken name
+ever enters the payload.
 
 AgentTask is the mechanism (livekit-agents 1.6.10). Awaiting one swaps the running
 agent's instructions for the task's, collects a typed answer through a single tool
@@ -28,7 +31,6 @@ from typing import Any, TypeVar
 from livekit import rtc
 from livekit.agents import AgentTask, function_tool
 
-from backend import CardinalClient, Student
 
 logger = logging.getLogger("mba606.intake")
 
@@ -69,100 +71,22 @@ class CallState:
     sip_call_id: str | None
     answered_at: float = field(default_factory=time.time)
 
-    student: Student | None = None
-    identity_confirmed: bool = False
-    # Set when the caller was matched but said it was not them. Distinguishes a
-    # denial from a number that never matched, which read the same after the
-    # discard below and made the reconciliation logs ambiguous.
-    identity_denied: bool = False
     consent: bool = False
     time_budget_s: float | None = None
 
     intake_complete: bool = False
     intake_finished_at: float | None = None
 
-    # True when the student was faked by MBA606_ADMIN_BYPASS rather than matched
-    # by the backend. Nothing downstream branches on it -- it exists so a test
-    # call is never mistaken for a real one in the logs.
-    bypassed: bool = False
-
     @property
-    def recordable(self) -> bool:
-        """Whether this call may be attached to a student record.
+    def submittable(self) -> bool:
+        """Whether we can post this call at all.
 
-        All three conditions are required. Dropping any one of them is what would
-        let a spoken name become a database write.
+        Only the phone number decides. The backend matches on it and rejects what
+        it cannot place, so a call with no caller ID has nothing to post against.
+        Consent governs what the transcript field *contains*, not whether the
+        call is reported -- a declined call still reports its duration.
         """
-        return self.student is not None and self.identity_confirmed and self.consent
-
-    def why_not_recordable(self) -> str:
-        if self.identity_denied:
-            return "caller said they are not the matched participant"
-        if self.student is None:
-            return "caller ID did not resolve to a participant"
-        if not self.identity_confirmed:
-            return "caller did not confirm they are the resolved participant"
-        if not self.consent:
-            return "caller did not consent to transcription"
-        return "recordable"
-
-
-def _digits(phone: str) -> str:
-    """Last ten digits, which is what survives every caller-ID format we might see.
-
-    Matching on the literal string would break the moment the carrier delivered
-    "15024086419" instead of "+15024086419", and the failure would look like the
-    bypass simply not working.
-    """
-    return "".join(c for c in phone if c.isdigit())[-10:]
-
-
-def admin_bypass(phone_number: str | None) -> Student | None:
-    """Fake a resolved student for one configured number, for end-to-end testing.
-
-    Set MBA606_ADMIN_BYPASS to "<phone>:<display name>" or
-    "<phone>:<display name>:<pronunciation>". It exists because the
-    backend's resolve endpoint does not, and without it there is no way to
-    exercise the identified-caller path -- identity confirmation, the named
-    consent script, a recordable call -- over a real phone line.
-
-    The participant id it invents is deliberately synthetic. If this is ever left
-    on while a real CARDINAL_API_BASE is configured, the resulting call cannot
-    land on a genuine student record.
-    """
-    raw = os.getenv("MBA606_ADMIN_BYPASS")
-    if not raw or not phone_number:
-        return None
-
-    configured, _, rest = raw.partition(":")
-    display_name, _, pronunciation = rest.partition(":")
-    display_name, pronunciation = display_name.strip(), pronunciation.strip()
-    if not configured.strip() or not display_name:
-        logger.error("MBA606_ADMIN_BYPASS is malformed, expected '<phone>:<name>': %r", raw)
-        return None
-
-    if _digits(configured) != _digits(phone_number):
-        return None
-
-    logger.warning(
-        "ADMIN BYPASS ACTIVE -- caller %s is being treated as %s without asking the "
-        "backend. This is a test path; the participant id is synthetic.",
-        phone_number,
-        display_name,
-    )
-    return Student(
-        participant_id=f"ADMIN_BYPASS_{_digits(phone_number)}",
-        display_name=display_name,
-        pronunciation=pronunciation or None,
-    )
-
-
-async def resolve_caller(client: CardinalClient, phone_number: str | None) -> Student | None:
-    """Resolve a caller, letting the admin bypass short-circuit the backend."""
-    override = admin_bypass(phone_number)
-    if override is not None:
-        return override
-    return await client.resolve_caller(phone_number)
+        return bool(self.phone_number)
 
 
 def extract_caller_id(participant: rtc.RemoteParticipant | None) -> tuple[str | None, str | None]:
@@ -202,74 +126,27 @@ def extract_caller_id(participant: rtc.RemoteParticipant | None) -> tuple[str | 
 # region tasks
 
 
-class ConfirmIdentityTask(AgentTask[bool]):
-    """Confirms the resolved name belongs to the person on the line."""
-
-    def __init__(self, display_name: str, pronunciation: str | None = None) -> None:
-        # Native-audio models mangle short names -- the first live call rendered
-        # "Gabe" as "Get". A phonetic respelling in the prompt is the only lever
-        # we have, since there is no separate TTS layer to hand a lexicon to.
-        spoken = f'{display_name} (pronounced "{pronunciation}")' if pronunciation else display_name
-        super().__init__(
-            instructions=(
-                f"You are opening a phone call. Greet the caller and ask one "
-                f'question: whether you are speaking with {spoken}.\n\n'
-                f"Then call confirm_identity -- true if they confirm they are "
-                f"{display_name}, false if they say otherwise or cannot say. If the "
-                f"reply is unclear, ask once more; hesitating is not a no, only their "
-                f"words are. Never ask for their name or suggest a different one.\n\n"
-                f"{_HOW}"
-            )
-        )
-
-    async def on_enter(self) -> None:
-        self.session.generate_reply()
-
-    @function_tool
-    async def confirm_identity(self, is_correct: bool) -> None:
-        """Record whether the caller confirmed they are the expected person.
-
-        Args:
-            is_correct: True only if the caller clearly confirmed their identity.
-        """
-        self.complete(is_correct)
-
-
 class ConsentTask(AgentTask[bool]):
-    """Explains transcription and asks permission.
+    """Explains transcription and asks permission. The first thing on every call.
 
-    Asked on every call, including calls where nothing can be stored. Someone
-    talking to a machine that transcribes should be told so regardless of whether
-    the transcript survives the call.
+    Asked before anything else, so a caller who declines has not first been made
+    to answer setup questions. There is no name to greet them by -- the backend
+    matches on the number they are calling from, and only after the call ends.
     """
 
-    def __init__(self, *, display_name: str | None, returning: bool = False) -> None:
-        if display_name is None:
-            body = (
-                "Tell the caller you could not confirm who they are, so nothing from "
-                "this conversation will be saved or attached to any student record, "
-                "but the conversation is still theirs to use. Then ask whether they "
-                "are comfortable continuing."
-            )
-        elif returning:
-            body = (
-                f"{display_name} has spoken with you before and already agreed to "
-                f"this. Remind them in one line that the conversation is transcribed "
-                f"and saved to their MBA 606 record, then ask if that is still okay."
-            )
-        else:
-            body = (
-                "Explain briefly that this conversation is transcribed, that the "
-                "transcript is saved to their MBA 606 record, and that it is used for "
-                "their own learning and for the class pilot. Then ask if that is okay."
-            )
-
+    def __init__(self) -> None:
         super().__init__(
             instructions=(
-                f"{body}\n\n"
-                f"Then call record_consent -- true if they agree, false if they "
-                f"decline. If the reply is unclear, ask once more; otherwise accept "
-                f"their answer without persuading them.\n\n"
+                "Greet the caller briefly. Explain that the conversation is "
+                "transcribed and saved to their MBA 606 record, matched by the number "
+                "they are calling from, and that it is used for their own learning "
+                "and for the class pilot. Then ask if that is okay.\n\n"
+                "If they would rather not, that is genuinely fine: tell them nothing "
+                "they say will be saved, only that the call happened and how long it "
+                "lasted, and that they are welcome to keep talking either way.\n\n"
+                "Then call record_consent -- true if they agree, false if they "
+                "decline. If the reply is unclear, ask once more; otherwise accept "
+                "their answer without persuading them.\n\n"
                 f"{_HOW}"
             )
         )
@@ -361,38 +238,14 @@ async def _run_step(task: AgentTask[T], *, default: T, label: str) -> T:
 
 
 async def run_intake(state: CallState) -> None:
-    """Ask the three setup questions, in order, mutating state as answers land.
+    """Ask the two setup questions, in order, mutating state as answers land.
 
     Must be awaited from the running Agent's on_enter -- the AgentTasks inside
-    resolve against whichever activity is current. Always returns: every branch either
-    gets an answer or takes a default, because a failed setup should still leave
-    the caller with a working conversation.
+    resolve against whichever activity is current. Always returns: every branch
+    either gets an answer or takes a default, because a failed setup should still
+    leave the caller with a working conversation.
     """
-    if state.student is not None:
-        confirmed = await _run_step(
-            ConfirmIdentityTask(state.student.display_name, state.student.pronunciation),
-            default=False,
-            label="confirm_identity",
-        )
-        state.identity_confirmed = confirmed
-        if not confirmed:
-            state.identity_denied = True
-            # Discard the record rather than holding it pending. Whoever is on the
-            # phone is not the person we matched, so the match is worthless.
-            logger.info(
-                "caller denied being %s -- discarding the resolved record",
-                state.student.display_name,
-            )
-            state.student = None
-
-    returning = state.student is not None and state.student.consent_on_file
-    name = state.student.display_name if state.student else None
-
-    state.consent = await _run_step(
-        ConsentTask(display_name=name, returning=returning),
-        default=False,
-        label="consent",
-    )
+    state.consent = await _run_step(ConsentTask(), default=False, label="consent")
 
     budget_min = await _run_step(
         TimeBudgetTask(),
@@ -404,8 +257,7 @@ async def run_intake(state: CallState) -> None:
     state.intake_finished_at = time.time()
 
     logger.info(
-        "intake complete: recordable=%s (%s), budget=%.0f min",
-        state.recordable,
-        state.why_not_recordable(),
+        "intake complete: consent=%s, budget=%.0f min",
+        state.consent,
         budget_min,
     )

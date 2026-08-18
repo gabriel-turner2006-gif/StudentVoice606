@@ -13,7 +13,7 @@ from livekit.plugins import noise_cancellation
 import pipeline
 import transcript
 from backend import CardinalClient
-from intake import CallState, clamp_minutes, extract_caller_id, resolve_caller, run_intake
+from intake import CallState, clamp_minutes, extract_caller_id, run_intake
 from timekeeper import TimeKeeper
 
 BASE_DIR = Path(__file__).parent
@@ -36,11 +36,15 @@ if SNAPPY:
 # The resolve request is fired the moment the caller joins, so by the time the
 # session is up it is normally already done. This is the ceiling on how long the
 # caller waits in silence for it before we give up and treat the call as anonymous.
-RESOLVE_WAIT_S = 1.5
-
 # A consented call still needs to contain a conversation. Below this many turns
 # after intake finished, there is nothing worth putting on a student's record.
 MIN_SUBSTANTIVE_TURNS = 4
+
+# What goes in the transcript field when the student says no. It must not be
+# empty: their validator rejects a payload with no transcript text before it ever
+# reaches participant matching, so an empty string risks a 400 that looks like a
+# malformed request rather than a handled decline.
+DECLINED_TRANSCRIPT = "Student did not consent to recording. No transcript retained."
 
 logger = logging.getLogger("mba606.latency")
 
@@ -59,39 +63,23 @@ class MentorAgent(Agent):
     """The MBA 606 thinking partner, fronted by the setup phase.
 
     on_enter does the whole of the first thirty seconds before the mentor prompt
-    ever gets to speak in its own voice: waits out the caller lookup, runs the
-    three intake questions as AgentTasks, then starts the clock.
+    ever gets to speak in its own voice: runs consent and the time question as
+    AgentTasks, then starts the clock. There is no caller lookup to wait on --
+    the backend resolves the phone number after the call, not before it.
     """
 
-    def __init__(self, state: CallState, resolve_task: asyncio.Task) -> None:
+    def __init__(self, state: CallState) -> None:
         super().__init__(instructions=INSTRUCTIONS)
         self._state = state
-        self._resolve_task = resolve_task
         self.timekeeper: TimeKeeper | None = None
 
     async def on_enter(self) -> None:
         if SNAPPY:
             # Pure latency harness. Consent scripts would drown the signal.
-            self._resolve_task.cancel()
             self.session.generate_reply()
             return
 
         state = self._state
-
-        try:
-            state.student = await asyncio.wait_for(self._resolve_task, timeout=RESOLVE_WAIT_S)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "caller lookup still pending after %.1fs -- proceeding anonymously",
-                RESOLVE_WAIT_S,
-            )
-        except Exception:
-            logger.exception("caller lookup failed -- proceeding anonymously")
-
-        state.bypassed = state.student is not None and state.student.participant_id.startswith(
-            "ADMIN_BYPASS_"
-        )
-
         await run_intake(state)
 
         keeper = TimeKeeper(self.session, self, INSTRUCTIONS)
@@ -169,9 +157,9 @@ async def entrypoint(ctx: JobContext):
 
     client = CardinalClient()
 
-    # Caller ID lives on the SIP participant, so the lookup cannot start until it
-    # joins. Firing it as a task here lets the round trip overlap session startup
-    # instead of adding itself to the silence before the greeting.
+    # Caller ID comes off the SIP participant. It is not checked against anything
+    # now -- it travels with the transcript at the end and the backend matches it
+    # there, because there is no side-effect-free lookup to call mid-call.
     try:
         participant = await ctx.wait_for_participant()
     except Exception:
@@ -180,7 +168,6 @@ async def entrypoint(ctx: JobContext):
 
     phone_number, sip_call_id = extract_caller_id(participant)
     state = CallState(phone_number=phone_number, sip_call_id=sip_call_id)
-    resolve_task = asyncio.create_task(resolve_caller(client, phone_number), name="resolve_caller")
 
     logger.info("pipeline: %s", pipeline.describe())
 
@@ -242,23 +229,42 @@ async def entrypoint(ctx: JobContext):
             ms("tts_node_ttfb"),
         )
 
-    agent = MentorAgent(state=state, resolve_task=resolve_task)
+    agent = MentorAgent(state=state)
 
     async def submit_call() -> None:
-        """Hand the finished call to the backend, if the call earned a record."""
+        """Post the finished call. One request, at the end -- the only one there is.
+
+        The backend is an end-of-call ingestion webhook, not a lifecycle API, so
+        this is where the caller finally gets matched to a participant record. A
+        404 here means the number was not on file; that is a real outcome, not a
+        failure, and the transcript stays with us for reconciliation.
+        """
         if agent.timekeeper is not None:
             agent.timekeeper.stop()
 
         try:
             duration = round(time.time() - state.answered_at)
 
-            # phone_number is implied by recordable -- a student is only ever set
-            # from a resolved number -- but state it so the invariant is visible.
-            if not state.recordable or not state.phone_number:
+            if not state.submittable:
                 logger.info(
-                    "call over (%ss) -- nothing submitted: %s",
+                    "call over (%ss) -- no caller ID, nothing to post against",
                     duration,
-                    state.why_not_recordable(),
+                )
+                return
+
+            if not state.consent:
+                # Still reported. The student declined to have their words kept,
+                # not to have the call exist -- duration is what the pilot needs
+                # and it carries none of what they said.
+                logger.info(
+                    "call over (%ss) -- student declined recording, posting duration only",
+                    duration,
+                )
+                await client.submit_transcript(
+                    phone_number=state.phone_number,
+                    transcript=DECLINED_TRANSCRIPT,
+                    call_duration_sec=duration,
+                    call_status=None,
                 )
                 return
 
@@ -273,20 +279,18 @@ async def entrypoint(ctx: JobContext):
                 )
                 return
 
-            if state.bypassed:
-                logger.warning(
-                    "submitting a call that used ADMIN BYPASS -- the participant id is "
-                    "synthetic, so this can only match on phone number, if at all"
-                )
+            # A call id in the header line. Their endpoint has no idempotency key,
+            # so if a retry ever double-posts this is the only thing that lets a
+            # human spot the duplicate.
+            header = f"[call {state.sip_call_id or 'unknown'}]"
 
             await client.submit_transcript(
                 phone_number=state.phone_number,
-                transcript=text,
+                transcript=f"{header}\n{text}",
                 call_duration_sec=duration,
                 # callStatus is deliberately omitted. The backend rejects values it
                 # reads as dropped/cancelled with a 400, and the accepted set is not
-                # finalized -- sending a guess risks throwing away a good call. See
-                # BACKEND_INTEGRATION.md for the values we are proposing.
+                # finalized -- sending a guess risks throwing away a good call.
                 call_status=None,
             )
         finally:
