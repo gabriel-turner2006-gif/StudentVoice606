@@ -30,8 +30,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from livekit.agents import inference
 
-# Loaded here, not just in test_agent.py. Every constant below is read at import
-# time, and test_agent.py calls load_dotenv() *after* its import block -- so
+# Loaded here, not just in agent.py. Every constant below is read at import
+# time, and agent.py calls load_dotenv() *after* its import block -- so
 # without this, an MBA606_* knob set in .env.local would be silently ignored
 # locally while working fine in deployment (where secrets are real env vars).
 # That is the kind of difference that costs an afternoon.
@@ -57,7 +57,7 @@ LLM_MODEL = os.getenv("MBA606_LLM", "openai/gpt-5.4-mini")
 # endpointing budget. Cartesia is built for streaming agents, not narration.
 #
 # Note the callers hear 8kHz G.711 anyway, which discards most of what separates
-# the top models. Compare with tts_compare.py, and listen to the .phone.wav files.
+# the top models -- judge any candidate on a phone call, not on studio audio.
 TTS_MODEL = os.getenv("MBA606_TTS", "cartesia/sonic-3.5")
 TTS_VOICE = os.getenv("MBA606_VOICE", "")
 
