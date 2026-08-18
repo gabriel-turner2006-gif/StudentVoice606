@@ -23,6 +23,9 @@ venv/
 .ruff_cache/
 coverage/
 
+# Undelivered call transcripts (host-side recovery file)
+undelivered_calls.jsonl
+
 # Logs and temp files
 *.log
 *.gz
