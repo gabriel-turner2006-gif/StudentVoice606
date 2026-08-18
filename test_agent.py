@@ -5,15 +5,15 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from google.genai import types
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentServer, AgentSession, JobContext
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, function_tool
 from livekit.agents.voice.room_io import AudioInputOptions, RoomOptions
-from livekit.plugins import google, noise_cancellation
+from livekit.plugins import noise_cancellation
 
+import pipeline
 import transcript
 from backend import CardinalClient
-from intake import CallState, extract_caller_id, resolve_caller, run_intake
+from intake import CallState, clamp_minutes, extract_caller_id, resolve_caller, run_intake
 from timekeeper import TimeKeeper
 
 BASE_DIR = Path(__file__).parent
@@ -22,37 +22,16 @@ load_dotenv(BASE_DIR / ".env.local")
 
 INSTRUCTIONS = (BASE_DIR / "system_prompt.txt").read_text(encoding="utf-8").strip()
 
-# Diagnostic only. The real prompt asks the agent to leave silence and go slowly, and
-# a native-audio model obeys that -- deliberate pacing sounds exactly like lag. Run a
-# call with MBA606_SNAPPY=1 to hear the same stack with the pacing removed. If the
-# pauses vanish, they were pedagogy, not latency.
+# Diagnostic only. MBA606_SNAPPY=1 swaps the mentor prompt out entirely, which
+# isolates pipeline latency from anything the prompt is doing to reply length.
 SNAPPY_INSTRUCTIONS = (
-    "You are a test harness. Reply the instant the user stops speaking, in one short "
-    "sentence. Never pause for effect. Never leave silence."
+    "You are a test harness. Reply in one short sentence. Never pause for effect."
 )
 
 SNAPPY = os.getenv("MBA606_SNAPPY") == "1"
 
 if SNAPPY:
     INSTRUCTIONS = SNAPPY_INSTRUCTIONS
-
-# How long the caller has to go quiet before Gemini treats the turn as over.
-# Lower = snappier replies; higher = more room for a student to pause mid-thought,
-# which the system prompt explicitly asks for. Tune this by ear.
-END_OF_TURN_SILENCE_MS = 200
-
-# Compress the audio context once it passes the trigger, down to the target. Starting
-# point only -- raise the target if the agent starts losing the thread of a long
-# session, lower it if ttft is still climbing turn over turn.
-COMPRESSION_TRIGGER_TOKENS = 10000
-COMPRESSION_TARGET_TOKENS = 5000
-
-# AgentSession loads inference.VAD(model="silero") whenever no vad= is passed, and
-# that VAD declares end-of-speech only after this much trailing silence. It does not
-# do turn-taking here -- Gemini owns that -- but it is the one clock in this process
-# that is independent of Google, which makes it the only usable zero point. Back it
-# out of the event stamp to recover roughly when the caller actually stopped talking.
-VAD_MIN_SILENCE_S = 0.25
 
 # The resolve request is fired the moment the caller joins, so by the time the
 # session is up it is normally already done. This is the ceiling on how long the
@@ -81,10 +60,7 @@ class MentorAgent(Agent):
 
     on_enter does the whole of the first thirty seconds before the mentor prompt
     ever gets to speak in its own voice: waits out the caller lookup, runs the
-    three intake questions as AgentTasks, then starts the clock. AgentTasks have
-    to be awaited from here rather than from a function tool -- Gemini's realtime
-    model reports manual_function_calls=False, which the SDK warns is undefined
-    behavior for a task awaited mid-tool-call.
+    three intake questions as AgentTasks, then starts the clock.
     """
 
     def __init__(self, state: CallState, resolve_task: asyncio.Task) -> None:
@@ -122,10 +98,7 @@ class MentorAgent(Agent):
         self.timekeeper = keeper
         if state.time_budget_s:
             keeper.start(state.time_budget_s)
-
-        # Hand the mentor prompt back with the budget folded in. Until the first
-        # time check fires this is the only thing telling the model how long it has.
-        await self.update_instructions(INSTRUCTIONS + keeper.opening_note())
+            await keeper.inject(keeper.opening_note())
 
         self.session.generate_reply(
             instructions=(
@@ -134,6 +107,32 @@ class MentorAgent(Agent):
                 "restate how much time they have."
             )
         )
+
+    @function_tool
+    async def revise_time_budget(self, minutes: float) -> str:
+        """Update how long the student has, when they say their available time changed.
+
+        Call this whenever the student signals a new amount of time -- "I have to jump
+        in five", "my meeting got cancelled, I have longer now", "let's make this
+        quick". It moves the whole schedule, including when to start wrapping up.
+
+        Args:
+            minutes: How many minutes the student now has from this moment on.
+        """
+        budget_s = clamp_minutes(minutes) * 60.0
+        self._state.time_budget_s = budget_s
+
+        if self.timekeeper is None:
+            return "Noted."
+
+        # start() is what arms the ticker; revise() only moves an already-running
+        # clock. An intake that produced no budget leaves the keeper unstarted.
+        if self.timekeeper.remaining_s is None:
+            self.timekeeper.start(budget_s)
+        else:
+            self.timekeeper.revise(budget_s)
+
+        return f"Time budget is now {budget_s / 60.0:.0f} minutes from now."
 
 
 # No agent_name: automatic dispatch, so the worker joins every room in the
@@ -158,90 +157,59 @@ async def entrypoint(ctx: JobContext):
     state = CallState(phone_number=phone_number, sip_call_id=sip_call_id)
     resolve_task = asyncio.create_task(resolve_caller(client, phone_number), name="resolve_caller")
 
+    logger.info("pipeline: %s", pipeline.describe())
+
     session = AgentSession(
         userdata=state,
-        llm=google.realtime.RealtimeModel(
-            voice="Charon",
-            # Gemini's server-side VAD owns turn-taking for realtime models, so this
-            # is where response latency actually lives -- there is no TTS to stream.
-            realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    silence_duration_ms=END_OF_TURN_SILENCE_MS,
-                    prefix_padding_ms=100,
-                ),
-            ),
-            # Native-audio thinking runs before the model emits a single audio frame,
-            # and the plugin drops the thought parts, so it shows up as pure silence.
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-            # Audio history is re-prefilled every turn, so ttft climbs as the session
-            # runs. Compressing the window keeps per-turn latency roughly flat instead
-            # of growing without bound over a long conversation.
-            context_window_compression=types.ContextWindowCompressionConfig(
-                trigger_tokens=COMPRESSION_TRIGGER_TOKENS,
-                sliding_window=types.SlidingWindow(
-                    target_tokens=COMPRESSION_TARGET_TOKENS,
-                ),
-            ),
-        ),
+        stt=pipeline.build_stt(),
+        llm=pipeline.LLM_MODEL,
+        tts=pipeline.build_tts(),
+        # VAD stays the framework default -- it is the half of the local inference
+        # library that works everywhere. Turn detection is forced to the cloud
+        # model; see pipeline.build_turn_detector(). Preemptive generation stays
+        # default-enabled: worth ~1.2s when it fires.
+        turn_handling=pipeline.turn_handling(),
     )
 
-    # Per-turn latency timeline, assembled from session events.
+    # Per-turn latency, straight from the framework.
     #
-    # It has to be assembled by hand because the realtime path publishes none of the
-    # pipeline latency metrics. `end_of_turn_delay` and `llm_node_ttft` are written
-    # only by the STT -> LLM -> TTS cascade; the realtime generation task attaches
-    # just started_speaking_at / stopped_speaking_at / playback_latency, and the user
-    # message gets no metrics at all because the Gemini plugin never sets
-    # turn_started_at. So the obvious `conversation_item_added` breakdown that used to
-    # live here printed nothing but playback_latency, which is why the delay has been
-    # hard to pin down.
+    # This used to be a hand-assembled timeline, because the Gemini realtime path
+    # published none of these metrics -- and it measured the wrong things twice
+    # over: its `ttft` was really the duration of the student's utterance, and its
+    # zero point drifted to the student's first micro-pause on exactly the long
+    # turns that mattered. On a cascade the framework publishes the real
+    # breakdown, so none of that reconstruction is needed or wanted.
     #
-    # Everything below is stamped relative to end of speech. The point is to see
-    # whether the transcript landing and the audio starting are two separate waits or
-    # one: Gemini emits both only after it commits the turn, so if they arrive close
-    # together the transcript is a symptom of the wait, not its cause.
-    turn: list[tuple[str, float]] = []
-    speech_end: float | None = None
+    #   eot    end_of_turn_delay  -- the endpointing decision. THE number to tune;
+    #                               it is what the whole move to a cascade bought.
+    #   stt    transcription_delay
+    #   llm    llm_node_ttft
+    #   tts    tts_node_ttfb      -- ~160-200ms on the gateway; not a factor.
+    #   e2e    e2e_latency        -- what the caller actually experiences.
+    turn_no = 0
 
-    def mark(label: str) -> None:
-        if speech_end is not None:
-            turn.append((label, (time.time() - speech_end) * 1000))
-
-    @session.on("user_state_changed")
-    def _on_user_state(ev):
-        nonlocal speech_end
-        if ev.new_state == "listening":
-            turn.clear()
-            speech_end = ev.created_at - VAD_MIN_SILENCE_S
-
-    @session.on("user_input_transcribed")
-    def _on_transcribed(ev):
-        # Input transcription streams while the caller is still talking, so the one
-        # that matters is whichever chunk lands last before the reply starts -- that
-        # is the moment the words finish rendering in the console.
-        mark("transcript" if not ev.is_final else "transcript FINAL")
-
-    @session.on("agent_state_changed")
-    def _on_agent_state(ev):
-        nonlocal speech_end
-        if ev.new_state != "speaking" or speech_end is None:
+    @session.on("conversation_item_added")
+    def _on_item(ev):
+        nonlocal turn_no
+        if getattr(ev.item, "role", None) != "assistant":
             return
-        mark("AGENT AUDIO")
-        logger.info(
-            "turn from end of speech: %s",
-            " | ".join(f"{label} +{ms:.0f}ms" for label, ms in turn),
-        )
-        speech_end = None
+        m = getattr(ev.item, "metrics", None)
+        if m is None:
+            return
+        turn_no += 1
 
-    @session.on("metrics_collected")
-    def _on_metrics(ev):
-        # ttft here is measured from the first server message of the turn (normally
-        # the input transcription) to the first audio byte -- so it is Gemini's
-        # generate time only. The commit-and-transcribe window that precedes it is
-        # invisible to this number; that gap is what the timeline above exposes.
-        ttft = getattr(ev.metrics, "ttft", None)
-        if isinstance(ttft, (int, float)) and ttft >= 0:
-            logger.info("gemini ttft (first server msg -> first audio) %.0fms", ttft * 1000)
+        def ms(value):
+            return f"{value * 1000:.0f}ms" if isinstance(value, (int, float)) else "n/a"
+
+        logger.info(
+            "turn %d: e2e %s | eot %s | stt %s | llm %s | tts %s",
+            turn_no,
+            ms(getattr(m, "e2e_latency", None)),
+            ms(getattr(m, "end_of_turn_delay", None)),
+            ms(getattr(m, "transcription_delay", None)),
+            ms(getattr(m, "llm_node_ttft", None)),
+            ms(getattr(m, "tts_node_ttfb", None)),
+        )
 
     agent = MentorAgent(state=state, resolve_task=resolve_task)
 
