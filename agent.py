@@ -83,7 +83,13 @@ class MentorAgent(Agent):
             return
 
         state = self._state
-        await run_intake(state)
+        await run_intake(state, self.session)
+
+        if state.caller_gone:
+            # The line is already down. Nothing to arm and no one to invite --
+            # starting a clock here would tick against a call that has ended.
+            # submit_call still runs at shutdown and posts whatever was said.
+            return
 
         if state.wants_to_end:
             # drain=True so the goodbye is actually spoken before the line drops.
@@ -215,33 +221,54 @@ async def entrypoint(ctx: JobContext):
     #   e2e    e2e_latency        -- what the caller actually experiences.
     turn_no = 0
 
+    # end_of_turn_delay and transcription_delay are documented "User ChatMessage
+    # only" (livekit/agents/llm/chat_context.py) -- they ride the user's item, not
+    # the reply's. Reading them off the assistant item printed "n/a" on every turn
+    # of every call, which silently hid end_of_turn_delay: the one number the move
+    # to a cascade was made for. So the user's half is stashed and spent on the
+    # reply that answers it, keeping one line per turn.
+    pending_user: dict = {}
+
     @session.on("conversation_item_added")
     def _on_item(ev):
-        nonlocal turn_no
-        if getattr(ev.item, "role", None) != "assistant":
-            return
+        nonlocal turn_no, pending_user
+        role = getattr(ev.item, "role", None)
         # MetricsReport is a TypedDict -- a plain dict at runtime. The framework
         # builds it as `assistant_metrics: llm.MetricsReport = {}` and assigns by
         # key, so it must be read with .get(). Reading it with getattr() returns
         # None for every field and logs a full row of "n/a" without erroring,
         # which is exactly how the first cascade call came back blind.
         m = getattr(ev.item, "metrics", None) or {}
-        if not m:
-            return
-        turn_no += 1
 
-        def ms(key):
-            value = m.get(key)
+        if role == "user":
+            # An item with no metrics is not a measured turn -- the timekeeper's
+            # [time check] lines are user-role too. Ignoring them keeps a real
+            # measurement waiting rather than clearing it.
+            if m:
+                pending_user = dict(m)
+            return
+
+        if role != "assistant" or not m:
+            return
+
+        turn_no += 1
+        # Agent-initiated turns -- the greeting, the post-setup invitation -- have
+        # no user turn in front of them. Clearing as we read means those log eot
+        # and stt as absent instead of borrowing an earlier turn's numbers.
+        user_m, pending_user = pending_user, {}
+
+        def ms(source, key):
+            value = source.get(key)
             return f"{value * 1000:.0f}ms" if isinstance(value, (int, float)) else "n/a"
 
         logger.info(
             "turn %d: e2e %s | eot %s | stt %s | llm %s | tts %s",
             turn_no,
-            ms("e2e_latency"),
-            ms("end_of_turn_delay"),
-            ms("transcription_delay"),
-            ms("llm_node_ttft"),
-            ms("tts_node_ttfb"),
+            ms(m, "e2e_latency"),
+            ms(user_m, "end_of_turn_delay"),
+            ms(user_m, "transcription_delay"),
+            ms(m, "llm_node_ttft"),
+            ms(m, "tts_node_ttfb"),
         )
 
     agent = MentorAgent(state=state)
