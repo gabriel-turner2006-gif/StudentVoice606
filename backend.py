@@ -1,16 +1,17 @@
-"""Client for the Cardinal Intelligence phone-agent backend.
+"""Client for the Cardinal Intelligence phone-agent webhook.
 
-Two calls matter to a phone conversation:
+One call matters: submit_transcript(), once, when the call ends. The backend is
+an end-of-call ingestion webhook rather than a lifecycle API -- caller matching
+happens there, on the phone number, after the conversation is over.
 
-  resolve_caller()     at call start -- turn a caller ID into a student record
-  submit_transcript()  at hangup     -- hand the conversation back
+resolve_caller() is kept but is NOT wired into the agent. There is no
+side-effect-free lookup on their side: the only way to reach the matching logic
+is to post a complete call, which persists a transcript and burns an extraction
+run, so using it as a lookup would create junk records. If they ever ship a real
+lookup endpoint (see integration.md section 6), this is where it plugs in.
 
-The transcript webhook is documented and verified working. The resolve endpoint
-is a proposal (see BACKEND_INTEGRATION.md); until it ships, resolve_caller
-returns None for everyone and every call runs the anonymous path.
-
-Everything here degrades to "anonymous call" rather than raising. A backend
-outage should cost us the student's record, never the conversation.
+Everything here degrades rather than raising. A backend outage should cost us the
+student's record, never the conversation.
 """
 
 from __future__ import annotations
@@ -101,7 +102,10 @@ class CardinalClient:
             await self._session.close()
 
     async def resolve_caller(self, phone_number: str | None) -> Student | None:
-        """Match a caller ID to a student. None means 'treat this call as anonymous'.
+        """Match a caller ID to a student, if a lookup endpoint ever exists.
+
+        Currently unused -- see the module docstring. Kept because the endpoint is
+        still an open ask and this is the shape we proposed.
 
         None covers every failure mode on purpose -- unknown number, endpoint not
         deployed yet, backend down, request timed out. The caller experience is

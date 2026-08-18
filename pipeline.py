@@ -25,8 +25,17 @@ comment before changing one.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
+from dotenv import load_dotenv
 from livekit.agents import inference
+
+# Loaded here, not just in test_agent.py. Every constant below is read at import
+# time, and test_agent.py calls load_dotenv() *after* its import block -- so
+# without this, an MBA606_* knob set in .env.local would be silently ignored
+# locally while working fine in deployment (where secrets are real env vars).
+# That is the kind of difference that costs an afternoon.
+load_dotenv(Path(__file__).parent / ".env.local")
 
 # Gateway model strings, resolved by AgentSession into inference.STT/LLM/TTS.
 STT_MODEL = os.getenv("MBA606_STT", "deepgram/nova-3")
@@ -40,8 +49,27 @@ STT_MODEL = os.getenv("MBA606_STT", "deepgram/nova-3")
 # before asking, which is what the persona demands.
 LLM_MODEL = os.getenv("MBA606_LLM", "openai/gpt-5.4-mini")
 
-TTS_MODEL = os.getenv("MBA606_TTS", "cartesia/sonic-3")
+# sonic-3.5 leads Artificial Analysis's Controlled Voice Arena (same 8 cloned
+# voices across every model, so it scores the model rather than whose voice you
+# happen to like). ElevenLabs v3 sounds better in isolation and is the wrong
+# trade here: it takes ~50% longer to speak the identical line (8.97s vs 6.00s
+# measured on our own copy), which costs more per turn than anything left in the
+# endpointing budget. Cartesia is built for streaming agents, not narration.
+#
+# Note the callers hear 8kHz G.711 anyway, which discards most of what separates
+# the top models. Compare with tts_compare.py, and listen to the .phone.wav files.
+TTS_MODEL = os.getenv("MBA606_TTS", "cartesia/sonic-3.5")
 TTS_VOICE = os.getenv("MBA606_VOICE", "")
+
+# Cartesia speaking rate: "slow" | "normal" | "fast", or a float. Measured on
+# sonic-3.5, same line, median of 3 runs each: slow 1.09x, fast 0.91x. So a real
+# and roughly symmetric +/-10% -- but per-utterance variance is nearly as large
+# (fast ranged 5.61-6.25s), so do not expect it to be audible on any single
+# reply, and do not expect it to rescue a reply that is simply too long. Reply
+# length is the lever for that, not rate.
+#
+# `emotion` is NOT available: Sonic 3 dropped it and the gateway 400s on it.
+TTS_SPEED = os.getenv("MBA606_TTS_SPEED", "normal")
 
 # Deepgram finalizes a segment after this much silence. The default is 25ms,
 # which is tuned for transcription, not conversation -- it shreds ordinary
@@ -61,19 +89,35 @@ TTS_VOICE = os.getenv("MBA606_VOICE", "")
 STT_ENDPOINTING_MS = int(os.getenv("MBA606_STT_ENDPOINTING_MS", "400"))
 
 # Endpointing is a cliff, not a slope: above this probability the turn commits in
-# ~0.36s, below it the turn waits out max_delay. In the reference run six of seven
-# turns cleared 0.56 and committed fast; one landed at 0.50, fell off the cliff,
-# and cost 2.0s -- the session's worst end-to-end (3708ms vs a 1297ms best). That
-# utterance was in fact complete, it just trailed off ("...like, pretty
-# consistent"). Genuinely mid-utterance predictions in the same run clustered at
-# 0.0002-0.23, far below either threshold, so 0.45 rescues the borderline case
-# without becoming impatient with someone who really is still thinking.
-EOT_THRESHOLD = float(os.getenv("MBA606_EOT_THRESHOLD", "0.45"))
+# ~0.36s, below it it waits out max_delay. The historic 0.45 came from tuning
+# against an earlier detector -- in that run six of seven turns cleared 0.56 and
+# committed fast, while one landed at 0.50, fell off the cliff, and cost 2.0s
+# (the session's worst e2e, 3708ms vs a 1297ms best) despite being a complete
+# utterance that merely trailed off.
+#
+# Left unset now, because the gateway objects on every call it is overridden:
+# "the server provides calibrated defaults and overriding them may be
+# suboptimal". The server's calibration moves with the model, so a number tuned
+# against an older one is a liability rather than an asset. Set
+# MBA606_EOT_THRESHOLD=0.45 to restore it and A/B against the eot column.
+EOT_THRESHOLD = os.getenv("MBA606_EOT_THRESHOLD")
+
+# min_delay has to clear the STT's own endpointing window. With Deepgram
+# finalizing after STT_ENDPOINTING_MS (400ms), a 0.3s min_delay commits the turn
+# before the final transcript can arrive -- the framework says so out loud:
+# "transcript arrives after turn has been committed. consider raising `min_delay`
+# in the endpointing options to accommodate a slow stt." That race is also what
+# splits one spoken thought into several separate user messages, because the tail
+# of the sentence lands after the turn is already gone.
+#
+# So this is not an independent knob: keep it above STT_ENDPOINTING_MS.
+MIN_ENDPOINTING_DELAY = float(
+    os.getenv("MBA606_MIN_DELAY", str(round(STT_ENDPOINTING_MS / 1000 + 0.1, 2)))
+)
 
 # max_delay applies only when the detector believes the student is NOT done.
 # 2.0s was the worst single latency in the reference run; 1.5s bounds it without
 # cutting off someone mid-thought.
-MIN_ENDPOINTING_DELAY = float(os.getenv("MBA606_MIN_DELAY", "0.3"))
 MAX_ENDPOINTING_DELAY = float(os.getenv("MBA606_MAX_DELAY", "1.5"))
 
 
@@ -91,11 +135,32 @@ def build_stt():
     return inference.STT(model=STT_MODEL, extra_kwargs={"endpointing": STT_ENDPOINTING_MS})
 
 
-def build_tts():
-    """Cartesia sonic-3. Gateway ttfb is ~160-200ms and is not a latency factor."""
+def build_tts() -> inference.TTS:
+    """Cartesia sonic-3.5. Gateway ttfb is ~160-200ms and is not a latency factor.
+
+    Always returns a real TTS object rather than a model string. Passing a string
+    lets AgentSession resolve it internally, and then there is no handle to call
+    update_options() on -- which is what makes the speaking rate steerable
+    mid-call. See MentorAgent.set_speaking_rate.
+    """
+    kwargs = {"extra_kwargs": {"speed": _coerce_speed(TTS_SPEED)}}
     if TTS_VOICE:
-        return inference.TTS(model=TTS_MODEL, voice=TTS_VOICE)
-    return TTS_MODEL
+        kwargs["voice"] = TTS_VOICE
+    return inference.TTS(model=TTS_MODEL, **kwargs)
+
+
+def _coerce_speed(value):
+    """Accept 'slow'/'normal'/'fast' or a numeric string; reject anything else.
+
+    Cartesia rejects out-of-range floats with a 400, which surfaces mid-call as a
+    dead turn rather than a config error, so a bad env value must not reach it.
+    """
+    if value in ("slow", "normal", "fast"):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return "normal"
 
 
 def build_turn_detector():
@@ -127,11 +192,10 @@ def build_turn_detector():
         # "stt" defers to the STT's own end-of-turn signal -- only meaningful with
         # a conversational model like flux, which emits one.
         return mode
-    return inference.TurnDetector(
-        version="v1",
-        local_fallback=False,
-        unlikely_threshold=EOT_THRESHOLD,
-    )
+    kwargs = {}
+    if EOT_THRESHOLD:
+        kwargs["unlikely_threshold"] = float(EOT_THRESHOLD)
+    return inference.TurnDetector(version="v1", local_fallback=False, **kwargs)
 
 
 def turn_handling() -> dict:
@@ -148,9 +212,12 @@ def turn_handling() -> dict:
 
 def describe() -> str:
     """One line for the logs, so a call's config is recoverable from its logs."""
-    td = os.getenv("MBA606_TURN_DETECTION") or f"eot v1 (threshold {EOT_THRESHOLD})"
+    td = os.getenv("MBA606_TURN_DETECTION") or (
+        f"eot v1 (threshold {EOT_THRESHOLD})" if EOT_THRESHOLD else "eot v1 (server-calibrated)"
+    )
     return (
         f"stt={STT_MODEL} (endpointing {STT_ENDPOINTING_MS}ms) llm={LLM_MODEL} "
-        f"tts={TTS_MODEL}{'/' + TTS_VOICE if TTS_VOICE else ''} turn_detection={td} "
+        f"tts={TTS_MODEL}{'/' + TTS_VOICE if TTS_VOICE else ''} (speed {TTS_SPEED}) "
+        f"turn_detection={td} "
         f"delay={MIN_ENDPOINTING_DELAY}-{MAX_ENDPOINTING_DELAY}s"
     )

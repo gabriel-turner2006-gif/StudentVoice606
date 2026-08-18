@@ -59,6 +59,19 @@ async def submit(req: web.Request) -> web.Response:
         return web.json_response({"error": "unauthorized"}, status=401)
 
     body = await req.json()
+
+    # Mirror the real validator: schema is checked BEFORE participant matching,
+    # and a missing or empty transcript 400s without ever reaching the lookup.
+    if not (body.get("transcript") or "").strip():
+        print("  submit -> 400 (no transcript text)")
+        return web.json_response(
+            {"error": "Malformed payload: Must provide raw transcript text or audio segments"},
+            status=400,
+        )
+    if not isinstance(body.get("callDurationSec"), (int, float)):
+        print("  submit -> 400 (no callDurationSec)")
+        return web.json_response({"error": "Malformed payload: callDurationSec"}, status=400)
+
     if body.get("phoneNumber") not in ROSTER:
         print(f"  submit {body.get('phoneNumber')} -> 404 (not on the roster)")
         return web.json_response({"error": "no match"}, status=404)
@@ -79,6 +92,8 @@ def main() -> None:
     args = ap.parse_args()
 
     app = web.Application()
+    # Kept only so a stray call is visibly 404-shaped rather than a connection
+    # error; the real backend has no such route and the agent no longer calls it.
     app.router.add_post("/api/webhooks/phone-agent/resolve", resolve)
     app.router.add_post("/api/webhooks/phone-agent", submit)
 
