@@ -10,6 +10,7 @@ from livekit.agents import Agent, AgentServer, AgentSession, JobContext, functio
 from livekit.agents.voice.room_io import AudioInputOptions, RoomOptions
 from livekit.plugins import noise_cancellation
 
+import course
 import pipeline
 import transcript
 from backend import CardinalClient
@@ -35,6 +36,20 @@ if SNAPPY:
 
 logger = logging.getLogger("mba606.latency")
 
+
+def mentor_instructions() -> str:
+    """Persona plus the course, assembled fresh for each call.
+
+    Per call rather than at import because course.spine() resolves which week the
+    class is in, and a worker process outlives a Tuesday. Under SNAPPY the persona
+    is a one-liner measuring pipeline latency -- a thousand tokens of course
+    material is exactly the signal it exists to exclude.
+    """
+    if SNAPPY:
+        return INSTRUCTIONS
+    return f"{INSTRUCTIONS}\n\n{course.spine()}"
+
+
 # `lk agent console` / `lk agent dev` discover this module-level variable.
 server = AgentServer()
 
@@ -56,7 +71,8 @@ class MentorAgent(Agent):
     """
 
     def __init__(self, state: CallState) -> None:
-        super().__init__(instructions=INSTRUCTIONS)
+        self._instructions = mentor_instructions()
+        super().__init__(instructions=self._instructions)
         self._state = state
         self.timekeeper: TimeKeeper | None = None
 
@@ -80,7 +96,7 @@ class MentorAgent(Agent):
             self.session.shutdown(drain=True)
             return
 
-        keeper = TimeKeeper(self.session, self, INSTRUCTIONS)
+        keeper = TimeKeeper(self.session, self, self._instructions)
         self.timekeeper = keeper
         if state.time_budget_s:
             keeper.start(state.time_budget_s)
@@ -168,6 +184,7 @@ async def entrypoint(ctx: JobContext):
     state = CallState(phone_number=phone_number, sip_call_id=sip_call_id)
 
     logger.info("pipeline: %s", pipeline.describe())
+    logger.info("course: %s", course.describe())
 
     session = AgentSession(
         userdata=state,
