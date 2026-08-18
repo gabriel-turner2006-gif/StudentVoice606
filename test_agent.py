@@ -5,12 +5,12 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from google.genai import types
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentServer, AgentSession, JobContext, function_tool, inference
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, function_tool
 from livekit.agents.voice.room_io import AudioInputOptions, RoomOptions
-from livekit.plugins import google, noise_cancellation
+from livekit.plugins import noise_cancellation
 
+import pipeline
 import transcript
 from backend import CardinalClient
 from intake import CallState, clamp_minutes, extract_caller_id, resolve_caller, run_intake
@@ -22,48 +22,16 @@ load_dotenv(BASE_DIR / ".env.local")
 
 INSTRUCTIONS = (BASE_DIR / "system_prompt.txt").read_text(encoding="utf-8").strip()
 
-# Diagnostic only. Run a call with MBA606_SNAPPY=1 to hear the same stack with the
-# mentor prompt swapped out entirely -- it isolates transport and model latency from
-# anything the prompt is doing. The old prompt asked the agent to leave silence and
-# not fill it, which a native-audio model renders as literal dead air; that wording
-# is gone, and this harness is how you confirm it stays gone.
+# Diagnostic only. MBA606_SNAPPY=1 swaps the mentor prompt out entirely, which
+# isolates pipeline latency from anything the prompt is doing to reply length.
 SNAPPY_INSTRUCTIONS = (
-    "You are a test harness. Reply the instant the user stops speaking, in one short "
-    "sentence. Never pause for effect. Never leave silence."
+    "You are a test harness. Reply in one short sentence. Never pause for effect."
 )
 
 SNAPPY = os.getenv("MBA606_SNAPPY") == "1"
 
 if SNAPPY:
     INSTRUCTIONS = SNAPPY_INSTRUCTIONS
-
-# How long the caller has to go quiet before Gemini treats the turn as over.
-#
-# The obvious tuning direction is wrong here. Set this too LOW and perceived gaps get
-# WORSE: a student thinking mid-sentence gets committed early, Gemini starts
-# generating, the student resumes, that interrupts and forces a regenerate -- so the
-# wait after they actually finish is long. 200ms was doing exactly that. Tune against
-# the `commit` number in the turn log below, not by feel.
-END_OF_TURN_SILENCE_MS = int(os.getenv("MBA606_EOT_MS", "700"))
-
-# 100ms clipped the start of speech, which produces bad transcripts and therefore
-# bad replies. Cheap to be generous here.
-PREFIX_PADDING_MS = int(os.getenv("MBA606_PREFIX_MS", "300"))
-
-# Compress the audio context once it passes the trigger, down to the target.
-#
-# This was 10k/5k, which on a native-audio model (~25 tokens/sec each way) fires
-# within about five minutes and then repeatedly, sliding the actual conversation out
-# of the window while the agent is still trying to converge -- the agent forgets the
-# first half of the call. The window is 128k, so these numbers still bound an
-# hour-long call. Raising them raises steady-state prefill; watch `in_tok` below to
-# see what that trade actually costs.
-COMPRESSION_TRIGGER_TOKENS = int(os.getenv("MBA606_COMPRESS_TRIGGER", "32000"))
-COMPRESSION_TARGET_TOKENS = int(os.getenv("MBA606_COMPRESS_TARGET", "16000"))
-
-# Charon is the deep, informational voice and reads as flat for a mentor. Pick by ear
-# on a real call -- Aoede, Leda, Sulafat and Zephyr are the warmer ones worth trying.
-VOICE = os.getenv("MBA606_VOICE", "Sulafat")
 
 # The resolve request is fired the moment the caller joins, so by the time the
 # session is up it is normally already done. This is the ceiling on how long the
@@ -92,10 +60,7 @@ class MentorAgent(Agent):
 
     on_enter does the whole of the first thirty seconds before the mentor prompt
     ever gets to speak in its own voice: waits out the caller lookup, runs the
-    three intake questions as AgentTasks, then starts the clock. AgentTasks have
-    to be awaited from here rather than from a function tool -- Gemini's realtime
-    model reports manual_function_calls=False, which the SDK warns is undefined
-    behavior for a task awaited mid-tool-call.
+    three intake questions as AgentTasks, then starts the clock.
     """
 
     def __init__(self, state: CallState, resolve_task: asyncio.Task) -> None:
@@ -133,9 +98,6 @@ class MentorAgent(Agent):
         self.timekeeper = keeper
         if state.time_budget_s:
             keeper.start(state.time_budget_s)
-            # One short line, not update_instructions(INSTRUCTIONS + note). That call
-            # would re-send the entire mentor prompt into the conversation -- see the
-            # timekeeper module docstring for why that is the thing to avoid.
             await keeper.inject(keeper.opening_note())
 
         self.session.generate_reply(
@@ -195,129 +157,59 @@ async def entrypoint(ctx: JobContext):
     state = CallState(phone_number=phone_number, sip_call_id=sip_call_id)
     resolve_task = asyncio.create_task(resolve_caller(client, phone_number), name="resolve_caller")
 
-    # An explicit VAD, purely to get an honest clock.
-    #
-    # AgentSession loads a default VAD when none is passed, but agent_activity.py
-    # UNWIRES it whenever a realtime model owns turn detection -- so user_state
-    # transitions came from Gemini's own server event, and the zero point for every
-    # measurement was Gemini's commit decision rather than the caller's speech. That
-    # made the commit wait structurally invisible. Passing a VAD explicitly sets
-    # using_default_vad False, keeps it wired, and hands us a clock Google does not
-    # own. Gemini still owns turn-taking; this only observes.
-    #
-    # Note this must stay a VAD. The bundled end-of-turn model segfaults this
-    # machine (see the hardware note in the cascade work) -- never let a local turn
-    # detector load here.
-    vad = inference.VAD(model="silero")
+    logger.info("pipeline: %s", pipeline.describe())
 
     session = AgentSession(
         userdata=state,
-        vad=vad,
-        llm=google.realtime.RealtimeModel(
-            voice=VOICE,
-            # Google's own control for flat, robotic delivery. The plugin switches to
-            # the v1alpha endpoint automatically when this is set.
-            enable_affective_dialog=True,
-            # Gemini's server-side VAD owns turn-taking for realtime models, so this
-            # is where response latency actually lives -- there is no TTS to stream.
-            realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    silence_duration_ms=END_OF_TURN_SILENCE_MS,
-                    prefix_padding_ms=PREFIX_PADDING_MS,
-                ),
-            ),
-            # Native-audio thinking runs before the model emits a single audio frame,
-            # and the plugin drops the thought parts, so it shows up as pure silence.
-            # Worth revisiting: zero reasoning budget is consistent with an agent that
-            # asks questions but never reaches a conclusion. Price a small budget
-            # against the turn log before deciding.
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-            # Audio history is re-prefilled every turn, so ttft climbs as the session
-            # runs. Compressing the window keeps per-turn latency roughly flat instead
-            # of growing without bound over a long conversation.
-            context_window_compression=types.ContextWindowCompressionConfig(
-                trigger_tokens=COMPRESSION_TRIGGER_TOKENS,
-                sliding_window=types.SlidingWindow(
-                    target_tokens=COMPRESSION_TARGET_TOKENS,
-                ),
-            ),
-        ),
+        stt=pipeline.build_stt(),
+        llm=pipeline.LLM_MODEL,
+        tts=pipeline.build_tts(),
+        # VAD stays the framework default -- it is the half of the local inference
+        # library that works everywhere. Turn detection is forced to the cloud
+        # model; see pipeline.build_turn_detector(). Preemptive generation stays
+        # default-enabled: worth ~1.2s when it fires.
+        turn_handling=pipeline.turn_handling(),
     )
 
-    # Per-turn latency timeline, assembled from session events.
+    # Per-turn latency, straight from the framework.
     #
-    # It has to be assembled by hand because the realtime path publishes none of the
-    # pipeline latency metrics: end_of_turn_delay and llm_node_ttft are written only
-    # by the STT -> LLM -> TTS cascade, and the Gemini plugin never sets
-    # turn_started_at, so the user message carries no metrics at all.
+    # This used to be a hand-assembled timeline, because the Gemini realtime path
+    # published none of these metrics -- and it measured the wrong things twice
+    # over: its `ttft` was really the duration of the student's utterance, and its
+    # zero point drifted to the student's first micro-pause on exactly the long
+    # turns that mattered. On a cascade the framework publishes the real
+    # breakdown, so none of that reconstruction is needed or wanted.
     #
-    # The decomposition that matters is two numbers, both measured from when the
-    # caller actually stopped talking:
-    #
-    #   commit -- how long Gemini took to decide the turn was over. Endpointing.
-    #             Tune END_OF_TURN_SILENCE_MS against this.
-    #   audio  -- when the caller first hears something. Everything after commit is
-    #             Gemini generating.
-    #
-    # Watch in_tok across a long call: if it climbs steadily rather than sitting flat
-    # between compressions, something is still injecting into the context, and that
-    # is the first thing to fix before touching any latency knob.
-    #
-    # The zero point is the wired VAD above. UserStateChangedEvent.created_at is
-    # already back-dated to true end of speech by the SDK (it subtracts the VAD's
-    # silence and inference time), so it is used raw -- an earlier version subtracted
-    # a hardcoded 250ms on top of that, and against a Gemini timestamp that was never
-    # a VAD delay in the first place.
-    speech_end: float | None = None
-    commit_ms: float | None = None
+    #   eot    end_of_turn_delay  -- the endpointing decision. THE number to tune;
+    #                               it is what the whole move to a cascade bought.
+    #   stt    transcription_delay
+    #   llm    llm_node_ttft
+    #   tts    tts_node_ttfb      -- ~160-200ms on the gateway; not a factor.
+    #   e2e    e2e_latency        -- what the caller actually experiences.
     turn_no = 0
 
-    @session.on("user_state_changed")
-    def _on_user_state(ev):
-        nonlocal speech_end, commit_ms
-        if ev.new_state == "listening":
-            speech_end = ev.created_at
-            commit_ms = None
-
-    @session.on("user_input_transcribed")
-    def _on_transcribed(ev):
-        # Gemini emits the final transcript only once it has committed the turn, so
-        # this lands at the moment the wait for endpointing ends.
-        nonlocal commit_ms
-        if ev.is_final and speech_end is not None and commit_ms is None:
-            commit_ms = (time.time() - speech_end) * 1000
-
-    @session.on("agent_state_changed")
-    def _on_agent_state(ev):
-        nonlocal speech_end, turn_no
-        if ev.new_state != "speaking" or speech_end is None:
+    @session.on("conversation_item_added")
+    def _on_item(ev):
+        nonlocal turn_no
+        if getattr(ev.item, "role", None) != "assistant":
             return
-        audio_ms = (time.time() - speech_end) * 1000
+        m = getattr(ev.item, "metrics", None)
+        if m is None:
+            return
         turn_no += 1
-        commit = f"{commit_ms:.0f}ms" if commit_ms is not None else "n/a"
-        logger.info(
-            "turn %d: commit +%s | audio +%.0fms (generate %s)",
-            turn_no,
-            commit,
-            audio_ms,
-            f"{audio_ms - commit_ms:.0f}ms" if commit_ms is not None else "n/a",
-        )
-        speech_end = None
 
-    @session.on("metrics_collected")
-    def _on_metrics(ev):
-        # ttft here is measured from the first server message of the turn to the first
-        # audio byte, so it is Gemini's generate time only -- the commit window that
-        # precedes it is invisible to this number. input_tokens is the drift read-out.
-        ttft = getattr(ev.metrics, "ttft", None)
-        in_tok = getattr(ev.metrics, "input_tokens", None)
-        if isinstance(ttft, (int, float)) and ttft >= 0:
-            logger.info(
-                "turn %d: gemini ttft %.0fms | in_tok %s",
-                turn_no,
-                ttft * 1000,
-                in_tok if in_tok is not None else "?",
-            )
+        def ms(value):
+            return f"{value * 1000:.0f}ms" if isinstance(value, (int, float)) else "n/a"
+
+        logger.info(
+            "turn %d: e2e %s | eot %s | stt %s | llm %s | tts %s",
+            turn_no,
+            ms(getattr(m, "e2e_latency", None)),
+            ms(getattr(m, "end_of_turn_delay", None)),
+            ms(getattr(m, "transcription_delay", None)),
+            ms(getattr(m, "llm_node_ttft", None)),
+            ms(getattr(m, "tts_node_ttfb", None)),
+        )
 
     agent = MentorAgent(state=state, resolve_task=resolve_task)
 
