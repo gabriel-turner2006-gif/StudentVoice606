@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from livekit import rtc
-from livekit.agents import AgentTask, function_tool
+from livekit.agents import AgentSession, AgentTask, function_tool
 
 
 logger = logging.getLogger("mba606.intake")
@@ -79,6 +79,9 @@ class CallState:
     consent_captured_at: str | None = None
     # Set when a caller who declined took the offer to hang up.
     wants_to_end: bool = False
+    # Set when the caller simply left mid-setup. Distinct from wants_to_end, which
+    # is a choice they said out loud and we acknowledged.
+    caller_gone: bool = False
 
     time_budget_s: float | None = None
 
@@ -256,10 +259,39 @@ def clamp_minutes(minutes: Any) -> float:
     return max(MIN_BUDGET_MIN, min(MAX_BUDGET_MIN, value))
 
 
+class IntakeAborted(Exception):
+    """The caller hung up before setup finished. Not an error -- an outcome."""
+
+
+def _session_closing(session: AgentSession) -> bool:
+    """Whether the session has already begun tearing down.
+
+    A caller hanging up mid-question is the ordinary end of a phone call, but the
+    SDK surfaces it exactly like a fault: AgentTask.cancel() completes the task's
+    future with ToolError("AgentTask <id> is cancelled"). Matching that message
+    would be matching on prose, so ask the session what state it is in instead.
+
+    _is_closing() is private, and it is used here because nothing public answers
+    the question -- RoomIO keeps its room handle private too, so there is no
+    supported route to "is the caller still on the line". Read through getattr so
+    that an SDK rename degrades to logging a hangup as an error, which is the
+    behaviour we have today, rather than breaking setup outright.
+    """
+    probe = getattr(session, "_is_closing", None)
+    if not callable(probe):
+        return False
+    try:
+        return bool(probe())
+    except Exception:
+        return False
+
+
 T = TypeVar("T")
 
 
-async def _run_step(task: AgentTask[T], *, default: T, label: str) -> T:
+async def _run_step(
+    task: AgentTask[T], *, default: T, label: str, session: AgentSession
+) -> T:
     """Await one intake task with a ceiling on how long it may run.
 
     asyncio.wait_for is not usable here: it would await the task from a fresh
@@ -278,39 +310,61 @@ async def _run_step(task: AgentTask[T], *, default: T, label: str) -> T:
     try:
         return await task
     except Exception:
+        if _session_closing(session):
+            # Nobody is on the line to answer the rest of setup. Raising beats
+            # returning a default: a default would invent a time budget for a
+            # call that has already ended, arm a clock against it, and log the
+            # whole thing as a completed setup.
+            logger.info("caller hung up during %r", label)
+            raise IntakeAborted from None
         logger.exception("intake step %r failed -- using default", label)
         return default
     finally:
         handle.cancel()
 
 
-async def run_intake(state: CallState) -> None:
+async def run_intake(state: CallState, session: AgentSession) -> None:
     """Ask the two setup questions, in order, mutating state as answers land.
 
     Must be awaited from the running Agent's on_enter -- the AgentTasks inside
-    resolve against whichever activity is current. Always returns: every branch
-    either gets an answer or takes a default, because a failed setup should still
-    leave the caller with a working conversation.
+    resolve against whichever activity is current. Always returns: a step that
+    fails takes a default, because a broken setup should still leave the caller
+    with a working conversation, and a caller who hangs up sets caller_gone and
+    leaves intake_complete False.
     """
-    state.consent = await _run_step(ConsentTask(), default=False, label="consent")
-    state.consent_captured_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-    if not state.consent:
-        state.wants_to_end = await _run_step(
-            DeclineExitTask(), default=False, label="decline_exit"
+    try:
+        state.consent = await _run_step(
+            ConsentTask(), default=False, label="consent", session=session
         )
-        if state.wants_to_end:
-            # No time question -- they are leaving. intake_complete stays False so
-            # nothing downstream mistakes this for a set-up conversation.
-            state.intake_finished_at = time.time()
-            logger.info("consent declined and caller chose to end the call")
-            return
+        state.consent_captured_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    budget_min = await _run_step(
-        TimeBudgetTask(),
-        default=DEFAULT_BUDGET_MIN,
-        label="time_budget",
-    )
+        if not state.consent:
+            state.wants_to_end = await _run_step(
+                DeclineExitTask(), default=False, label="decline_exit", session=session
+            )
+            if state.wants_to_end:
+                # No time question -- they are leaving. intake_complete stays False
+                # so nothing downstream mistakes this for a set-up conversation.
+                state.intake_finished_at = time.time()
+                logger.info("consent declined and caller chose to end the call")
+                return
+
+        budget_min = await _run_step(
+            TimeBudgetTask(),
+            default=DEFAULT_BUDGET_MIN,
+            label="time_budget",
+            session=session,
+        )
+    except IntakeAborted:
+        # intake_complete stays False for the same reason as the decline path: the
+        # conversation this was setting up never happened. Whatever was said before
+        # they left still posts at shutdown -- consent, if they gave it, governs
+        # whether the transcript rides along.
+        state.caller_gone = True
+        state.intake_finished_at = time.time()
+        logger.info("setup abandoned -- caller left before it finished")
+        return
+
     state.time_budget_s = budget_min * 60.0
     state.intake_complete = True
     state.intake_finished_at = time.time()

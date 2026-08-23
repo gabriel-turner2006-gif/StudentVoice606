@@ -117,9 +117,11 @@ student says their time changed.
 | `timekeeper.py` | Keeps the time budget alive in the model's context. |
 | `backend.py` | `CardinalClient` — the single end-of-call POST, retries, dead-letter queue. |
 | `transcript.py` | Renders session history into a timestamped transcript string. |
+| `course.py` | MBA 606 itself, compiled small enough to sit in every prompt. Resolves the current week. |
 | `system_prompt.txt` | The mentor persona. Edited far more often than the code. |
 | `tools/dev_stub_backend.py` | Local stand-in for Cardinal. Enforces the real contract. |
-| `docs/syllabus.md` | Course material. **Not wired in yet** — intended as future agent context. |
+| `tools/show_prompt.py` | Prints and sizes the assembled instructions. Run it before the spine grows. |
+| `docs/syllabus.md` | The human-readable source for `course.py`. Not loaded at runtime, and `.dockerignore`d out of the image — the two are kept in sync by hand. |
 
 ---
 
